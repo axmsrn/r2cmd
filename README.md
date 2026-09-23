@@ -5,7 +5,7 @@
 [![.NET](https://img.shields.io/badge/.NET-10.0-512BD4.svg)](https://dotnet.microsoft.com/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-A fast, lightweight dual-pane file manager for Windows built with WPF and .NET 8.
+A fast, lightweight dual-pane file manager for Windows built with WPF and .NET 10.
 Designed around minimalism — only what's necessary, nothing extra.
 Optimized for performance, keyboard efficiency, and seamless remote workflows.
 Ships as a single portable executable with built-in SSH/SFTP support.
