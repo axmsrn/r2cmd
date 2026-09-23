@@ -20,6 +20,19 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         public SshSession Session;
         public readonly SemaphoreSlim Gate = new(1, 1);
 
+        // How many callers are waiting for the Gate right now. A background
+        // size scan checks it and steps aside: SemaphoreSlim is not fair, and
+        // a loop that releases and immediately re-takes the Gate would win
+        // every time against a pane that is waiting for a listing.
+        public int Waiters;
+
+        public void Enter(CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref Waiters);
+            try { Gate.Wait(ct); }
+            finally { Interlocked.Decrement(ref Waiters); }
+        }
+
         // When this session was last touched, and how many transfer streams are
         // still open on it. Both are read by the idle sweeper.
         public long LastUsedTicks;
@@ -117,7 +130,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
             _connections.Remove(sessionName);
         }
 
-        conn.Gate.Wait();
+        conn.Enter();
         try
         {
             try { if (conn.Client.IsConnected) conn.Client.Disconnect(); } catch { }
@@ -144,7 +157,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
     public static TimeSpan IdleTimeout { get; set; } = TimeSpan.FromMinutes(5);
 
     private static readonly HashSet<string> s_pinned = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly object s_sweeperLock = new();
+    private static readonly System.Threading.Lock s_sweeperLock = new();
     private static Timer? s_sweeper;
 
     /// <summary>Sessions currently displayed in a pane. Never swept.</summary>
@@ -250,7 +263,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
 
                 ct.ThrowIfCancellationRequested();
 
-                conn.Gate.Wait(ct);
+                conn.Enter(ct);
                 try
                 {
                     try
@@ -315,7 +328,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         var (session, remote) = SplitSshPath(sshPath);
         var conn = RequireConnection(session);
 
-        conn.Gate.Wait(ct);
+        conn.Enter(ct);
         try
         {
             Stream src = OpenReadWithRetry(conn, remote);
@@ -344,7 +357,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         var (session, remote) = SplitSshPath(sshPath);
         var conn = RequireConnection(session);
 
-        conn.Gate.Wait(ct);
+        conn.Enter(ct);
         try
         {
             Stream dst = CreateWithRetry(conn, remote);
@@ -380,6 +393,30 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         return WithClient(session, c => { try { return c.GetAttributes(remote).IsDirectory; } catch { return false; } });
     }
 
+    // =========================================================================
+    // Size and last write time of one remote entry, read with a single SFTP
+    // stat. Remote folders have no watcher, so after the application itself
+    // uploads a file (editor save) this is how its row gets the new values
+    // without re-reading the whole directory. Local time, the same kind
+    // ListInto puts into FileEntry.Modified.
+    // =========================================================================
+    public static (long Size, DateTime Modified)? RemoteStat(string sshPath)
+    {
+        var (session, remote) = SplitSshPath(sshPath);
+        return WithClient<(long Size, DateTime Modified)?>(session, c =>
+        {
+            try
+            {
+                var attributes = c.GetAttributes(remote);
+                return (attributes.IsDirectory ? 0 : attributes.Size, attributes.LastWriteTime);
+            }
+            catch
+            {
+                return null;
+            }
+        });
+    }
+
     public static void RemoteCreateDirectory(string sshPath)
     {
         var (session, remote) = SplitSshPath(sshPath);
@@ -407,16 +444,110 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         WithClient<object?>(session, c => { DeleteRecursive(c, remote); return null; });
     }
 
-    public static (int Files, long Bytes) RemoteSumTree(string sshPath)
+    // =========================================================================
+    // Size of a remote tree, with the connection lock taken PER DIRECTORY.
+    //
+    // The walk used to run inside one WithClient call, holding the session's
+    // Gate for the whole tree: thousands of listings, often minutes. Anything
+    // else on that session, above all the pane listing a folder, queued behind
+    // it, so coming back to an SSH folder during a size scan showed nothing but
+    // the loading dots until the scan finished.
+    //
+    // Now each listing takes the Gate on its own. Between two listings a pane
+    // request gets its turn, so navigation waits for one listing at most.
+    // A directory that cannot be read (permission denied) is skipped instead of
+    // failing the whole count, the same as local scans do.
+    // =========================================================================
+    public static (int Files, long Bytes) RemoteSumTree(string sshPath, CancellationToken ct = default)
     {
         var (session, remote) = SplitSshPath(sshPath);
-        return WithClient(session, c =>
+
+        // =====================================================================
+        // First choice: count on the server. One command, one line back, the
+        // server walks its own disk locally. The SFTP walk below needs a
+        // network round trip per directory and is tens of times slower on a
+        // large tree. It runs on its own SSH channel, so it never touches the
+        // SFTP Gate either.
+        //
+        // Needs GNU find (-printf). Elsewhere (BusyBox, BSD) find prints
+        // nothing and awk reports 0 files; zero is therefore never trusted and
+        // falls through to the SFTP walk, which is cheap for a truly empty
+        // folder anyway.
+        // =====================================================================
+        string quoted = remote.Replace("'", "'\\''");
+        string sumCmd =
+            $"find '{quoted}' -type f -printf '%s\\n' 2>/dev/null | " +
+            "awk '{ n++; s += $1 } END { printf \"%d %.0f\\n\", n, s }'";
+
+        string? summary = RunCommand(session, sumCmd, ct);
+        var fields = summary?.Trim().Split(' ');
+        if (fields is { Length: 2 } &&
+            int.TryParse(fields[0], out int serverFiles) && serverFiles > 0 &&
+            long.TryParse(fields[1], out long serverBytes))
         {
-            int files = 0;
-            long bytes = 0;
-            SumTree(c, remote, ref files, ref bytes);
-            return (files, bytes);
-        });
+            return (serverFiles, serverBytes);
+        }
+
+        ct.ThrowIfCancellationRequested();
+
+        var conn = RequireConnection(session);
+
+        var root = WithClient(session, c => c.GetAttributes(remote));
+        if (!root.IsDirectory) return (1, root.Size);
+
+        int files = 0;
+        long bytes = 0;
+
+        var pending = new Stack<string>();
+        pending.Push(remote);
+
+        while (pending.Count > 0)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            string dir = pending.Pop();
+
+            // Anyone else waiting (a pane listing, F3, a copy) goes first
+            while (Volatile.Read(ref conn.Waiters) > 0) Thread.Sleep(10);
+
+            (List<string> Dirs, int Files, long Bytes) part;
+            try
+            {
+                // One directory per lock. Counted into fresh locals: WithClient
+                // may run the lambda a second time after a reconnect, and the
+                // totals must not include a half-counted first attempt.
+                part = WithClient(session, c =>
+                {
+                    var dirs = new List<string>();
+                    int f = 0;
+                    long b = 0;
+
+                    foreach (var item in c.ListDirectory(dir))
+                    {
+                        if (item.Name is "." or "..") continue;
+
+                        if (item.IsDirectory) dirs.Add(RemoteCombine(dir, item.Name));
+                        else
+                        {
+                            f++;
+                            b += item.Length;
+                        }
+                    }
+
+                    return (dirs, f, b);
+                });
+            }
+            catch (SftpPermissionDeniedException)
+            {
+                continue;
+            }
+
+            files += part.Files;
+            bytes += part.Bytes;
+            foreach (var sub in part.Dirs) pending.Push(sub);
+        }
+
+        return (files, bytes);
     }
 
     private static SshConnection RequireConnection(string sessionName)
@@ -429,7 +560,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
     private static T WithClient<T>(string sessionName, Func<SftpClient, T> action)
     {
         var conn = RequireConnection(sessionName);
-        conn.Gate.Wait();
+        conn.Enter();
         try
         {
             try { return action(conn.Client); }
@@ -493,24 +624,6 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         else c.DeleteFile(remote);
     }
 
-    private static void SumTree(SftpClient c, string remote, ref int files, ref long bytes)
-    {
-        var attrs = c.GetAttributes(remote);
-        if (!attrs.IsDirectory)
-        {
-            files++;
-            bytes += attrs.Size;
-            return;
-        }
-
-        foreach (var f in c.ListDirectory(remote))
-        {
-            if (f.Name is "." or "..") continue;
-            if (f.IsDirectory) SumTree(c, RemoteCombine(remote, f.Name), ref files, ref bytes);
-            else { files++; bytes += f.Length; }
-        }
-    }
-
     private static (string Session, string Remote) SplitSshPath(string sshPath)
     {
         string rest = sshPath.Substring(6);
@@ -559,8 +672,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         SftpClient client;
         try
         {
-            client = CreateClient(session);
-            client.Connect();
+            client = ConnectSftp(session);
         }
         catch (Exception ex)
         {
@@ -608,8 +720,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
     {
         var old = conn.Client;
 
-        var client = CreateClient(conn.Session);
-        client.Connect();
+        var client = ConnectSftp(conn.Session);
 
         conn.Client = client;
 
@@ -617,33 +728,202 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         try { old.Dispose(); } catch { }
     }
 
-    private static SftpClient CreateClient(SshSession session)
+    private static SftpClient ConnectSftp(SshSession session) =>
+        ConnectWithRetry(session, info => new SftpClient(info)
+        {
+            KeepAliveInterval = TimeSpan.FromSeconds(30),
+            BufferSize = SftpBufferSize
+        });
+
+    // =========================================================================
+    // Every SSH connection in the application is made here: SFTP for the panes,
+    // SshClient for remote commands (search) and for the terminal. The same
+    // settings used to be built in three places.
+    //
+    // One automatic retry: a first attempt that times out or is reset during
+    // the handshake usually succeeds on the second, which is what the user was
+    // doing by clicking again. A rejected login is not retried: a wrong password
+    // stays wrong, and repeated failures can get the address blocked by the
+    // server (fail2ban and the like).
+    // =========================================================================
+    internal static T ConnectWithRetry<T>(SshSession session, Func<ConnectionInfo, T> create)
+        where T : BaseClient
     {
-        ConnectionInfo connInfo;
+        for (int attempt = 1; ; attempt++)
+        {
+            T client = create(CreateConnectionInfo(session));
+
+            // Every connection in the application passes here, so this one
+            // handler covers the panes, remote commands and the terminal
+            bool keyRejected = false;
+            client.HostKeyReceived += (_, e) =>
+            {
+                e.CanTrust = VerifyHostKey(session, e.HostKeyName, e.FingerPrintSHA256);
+                if (!e.CanTrust) keyRejected = true;
+            };
+
+            try
+            {
+                client.Connect();
+                return client;
+            }
+            // A rejected key is never retried: the user said no
+            catch (Exception ex) when (attempt < 2 && !keyRejected && ex is not SshAuthenticationException)
+            {
+                try { client.Dispose(); } catch { }
+                Thread.Sleep(500);
+            }
+            catch
+            {
+                try { client.Dispose(); } catch { }
+                if (keyRejected)
+                    throw new IOException("The server's host key was not accepted.");
+                throw;
+            }
+        }
+    }
+
+    // =========================================================================
+    // HOST KEY VERIFICATION (known hosts)
+    //
+    // Without it the client connected to whatever answered at the address and
+    // sent it the password: anyone able to redirect the traffic (a hostile
+    // Wi-Fi, a poisoned DNS answer) received the credentials.
+    //
+    // Trust on first use, as OpenSSH, PuTTY and WinSCP do: the first connection
+    // to a server shows its key fingerprint and asks; the key is then stored in
+    // %APPDATA%\R2Cmd\known_hosts and checked silently every time. A different
+    // key later is a loud warning with "No" as the safe answer.
+    //
+    // One prompt at a time: several connections to a new server (a pane, the
+    // selection count, a size scan) start together and would otherwise ask the
+    // same question several times. The UI thread never blocks on that lock: if
+    // it were to wait while another thread waits for the UI to show its
+    // dialog, both would hang.
+    // =========================================================================
+    private static readonly SemaphoreSlim s_hostKeyPrompt = new(1, 1);
+    private static readonly object s_knownHostsLock = new();
+    private static Dictionary<string, string>? s_knownHosts;
+
+    private static string KnownHostsPath =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "R2Cmd", "known_hosts");
+
+    private static bool VerifyHostKey(SshSession session, string algorithm, string fingerprint)
+    {
+        string host = $"{session.Host}:{session.Port}";
+        string presented = $"{algorithm} SHA256:{fingerprint}";
+
+        var dispatcher = System.Windows.Application.Current?.Dispatcher;
+        if (dispatcher == null) return false;
+
+        bool onUiThread = dispatcher.CheckAccess();
+        if (onUiThread ? !s_hostKeyPrompt.Wait(0) : !s_hostKeyPrompt.Wait(Timeout.Infinite)) return false;
+
+        try
+        {
+            // Checked again after waiting: the prompt that held the lock may
+            // just have stored this very key
+            string? known = GetKnownHost(host);
+            if (known == presented) return true;
+
+            string message = known == null
+                ? "The authenticity of this server has not been confirmed yet.\n\n" +
+                  $"Server: {host}\nKey: {presented}\n\n" +
+                  "If you can, compare it with the server's own fingerprint:\n" +
+                  "ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub\n\n" +
+                  "Trust this key and connect?"
+                : "WARNING: THE SERVER'S HOST KEY HAS CHANGED!\n\n" +
+                  $"Server: {host}\nStored: {known}\nPresented: {presented}\n\n" +
+                  "This is expected after the server was reinstalled. Otherwise someone " +
+                  "may be intercepting the connection, and you should answer No.\n\n" +
+                  "Replace the stored key and connect?";
+
+            string title = known == null ? "New SSH Server" : "SSH Host Key Changed";
+
+            bool accepted = dispatcher.Invoke(() =>
+            {
+                var dialog = new ConfirmDialog(message, title)
+                {
+                    Owner = System.Windows.Application.Current.MainWindow
+                };
+                return dialog.ShowDialog() == true;
+            });
+
+            if (accepted) SetKnownHost(host, presented);
+            return accepted;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            s_hostKeyPrompt.Release();
+        }
+    }
+
+    // File format, one server per line: "host:port algorithm SHA256:fingerprint"
+    private static string? GetKnownHost(string host)
+    {
+        lock (s_knownHostsLock)
+        {
+            if (s_knownHosts == null)
+            {
+                s_knownHosts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    if (File.Exists(KnownHostsPath))
+                    {
+                        foreach (string line in File.ReadAllLines(KnownHostsPath))
+                        {
+                            int space = line.IndexOf(' ');
+                            if (space > 0) s_knownHosts[line[..space]] = line[(space + 1)..].Trim();
+                        }
+                    }
+                }
+                catch { /* unreadable file: every server is asked about again */ }
+            }
+
+            return s_knownHosts.TryGetValue(host, out var key) ? key : null;
+        }
+    }
+
+    private static void SetKnownHost(string host, string key)
+    {
+        lock (s_knownHostsLock)
+        {
+            s_knownHosts ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            s_knownHosts[host] = key;
+
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(KnownHostsPath)!);
+                File.WriteAllLines(KnownHostsPath, s_knownHosts.Select(kv => $"{kv.Key} {kv.Value}"));
+            }
+            catch { /* kept in memory for this session at least */ }
+        }
+    }
+
+    private static ConnectionInfo CreateConnectionInfo(SshSession session)
+    {
+        AuthenticationMethod auth;
 
         if (session.AuthMethod == SshAuthMethod.PrivateKey)
         {
             var keyFile = string.IsNullOrEmpty(session.Passphrase)
                 ? new PrivateKeyFile(session.PrivateKeyPath)
                 : new PrivateKeyFile(session.PrivateKeyPath, session.Passphrase);
-
-            connInfo = new ConnectionInfo(session.Host, session.Port, session.Username,
-                new PrivateKeyAuthenticationMethod(session.Username, keyFile));
+            auth = new PrivateKeyAuthenticationMethod(session.Username, keyFile);
         }
         else
         {
-            connInfo = new ConnectionInfo(session.Host, session.Port, session.Username,
-                new PasswordAuthenticationMethod(session.Username, session.Password));
+            auth = new PasswordAuthenticationMethod(session.Username, session.Password);
         }
 
-        connInfo.Timeout = TimeSpan.FromSeconds(session.TimeoutSeconds);
-
-        var client = new SftpClient(connInfo)
+        return new ConnectionInfo(session.Host, session.Port, session.Username, auth)
         {
-            KeepAliveInterval = TimeSpan.FromSeconds(30),
-            BufferSize = SftpBufferSize
+            Timeout = TimeSpan.FromSeconds(session.TimeoutSeconds)
         };
-        return client;
     }
 
     private static void ListInto(SftpClient client, string remotePath, string sessionName, List<FileEntry> entries)
@@ -698,7 +978,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         var (session, remote) = SplitSshPath(path);
         var conn = RequireConnection(session);
 
-        conn.Gate.Wait(ct);
+        conn.Enter(ct);
         try
         {
             return Task.FromResult<Stream>(new LeasedStream(OpenReadWithRetry(conn, remote), conn));
@@ -711,7 +991,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         var (session, remote) = SplitSshPath(path);
         var conn = RequireConnection(session);
 
-        conn.Gate.Wait(ct);
+        conn.Enter(ct);
         try
         {
             return Task.FromResult<Stream>(new LeasedStream(CreateWithRetry(conn, remote), conn));
@@ -740,27 +1020,8 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
 
         try
         {
-            AuthenticationMethod auth;
-            if (session.AuthMethod == SshAuthMethod.PrivateKey)
-            {
-                var keyFile = string.IsNullOrEmpty(session.Passphrase)
-                    ? new PrivateKeyFile(session.PrivateKeyPath)
-                    : new PrivateKeyFile(session.PrivateKeyPath, session.Passphrase);
-                auth = new PrivateKeyAuthenticationMethod(session.Username, keyFile);
-            }
-            else
-            {
-                auth = new PasswordAuthenticationMethod(session.Username, session.Password);
-            }
-
-            var connInfo = new ConnectionInfo(session.Host, session.Port, session.Username, auth)
-            {
-                Timeout = TimeSpan.FromSeconds(session.TimeoutSeconds)
-            };
-
-            var ssh = new SshClient(connInfo);
+            var ssh = ConnectWithRetry(session, info => new SshClient(info));
             client = ssh;
-            ssh.Connect();
 
             using var cmd = ssh.CreateCommand(command);
             cmd.CommandTimeout = TimeSpan.FromMinutes(5);

@@ -43,9 +43,11 @@ public sealed class TextQuery
     // Counts the exact number of times the target text or regex appears in the line
     public int CountMatches(string line)
     {
+        // Regex.Count walks the matches without building a MatchCollection and a
+        // Match object per hit, which Matches(...).Count did for every line
         if (_regex != null)
         {
-            return _regex.Matches(line).Count;
+            return _regex.Count(line);
         }
 
         if (string.IsNullOrEmpty(Text)) return 0;
@@ -88,7 +90,10 @@ public static class TextSearcher
             var info = new FileInfo(path);
             if (!info.Exists || info.Length == 0 || info.Length > MaxFileSize) return 0;
 
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 32768);
+            // bufferSize 1 turns off FileStream's own buffer: the StreamReader in
+            // CountMatchesInStream already reads in 32 KB blocks, and two layers
+            // of buffering only copied every byte twice
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1);
             return CountMatchesInStream(stream, query, token);
         }
         catch (OperationCanceledException) { throw; }
@@ -104,7 +109,9 @@ public static class TextSearcher
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
 
             var sample = new byte[SampleSize];
-            int read = stream.Read(sample, 0, sample.Length);
+
+            // Read may return less than asked even mid-file; ReadAtLeast does not
+            int read = stream.ReadAtLeast(sample, sample.Length, throwOnEndOfStream: false);
 
             return read == 0 ? new UTF8Encoding(false) : DetectEncoding(sample, read);
         }
@@ -124,11 +131,22 @@ public static class TextSearcher
             return CountMatchesInStream(memory, query, token);
         }
 
-        var sample = new byte[SampleSize];
-        int read = stream.Read(sample, 0, sample.Length);
-        if (read == 0) return 0;
+        // Pooled: a content search opens thousands of files, and a fresh 8 KB
+        // array per file was steady garbage
+        byte[] sample = System.Buffers.ArrayPool<byte>.Shared.Rent(SampleSize);
+        Encoding? encoding;
+        try
+        {
+            int read = stream.ReadAtLeast(sample.AsSpan(0, SampleSize), SampleSize, throwOnEndOfStream: false);
+            if (read == 0) return 0;
 
-        var encoding = DetectEncoding(sample, read);
+            encoding = DetectEncoding(sample, read);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(sample);
+        }
+
         if (encoding == null) return 0;   // binary
 
         stream.Position = 0;

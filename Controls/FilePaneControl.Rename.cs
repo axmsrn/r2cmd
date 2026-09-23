@@ -1,46 +1,38 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
-using System.Windows.Media;
 using R2Cmd.Providers;
 
 namespace R2Cmd.Controls;
 
 public partial class FilePaneControl
 {
-    // =========================================================================
-    // Native Windows kernel imports for atomic file operations
-    // =========================================================================
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    // EntryPoint is required: kernel32 exports only MoveFileExA and MoveFileExW.
+    // DllImport used to find the W version by itself; LibraryImport looks for
+    // the exact name "MoveFileEx", which does not exist, and every overwrite
+    // on rename failed with "Entry point was not found".
+    [LibraryImport("kernel32.dll", EntryPoint = "MoveFileExW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, uint dwFlags);
+    private static partial bool MoveFileEx(string lpExistingFileName, string lpNewFileName, uint dwFlags);
 
     private const uint MOVEFILE_REPLACE_EXISTING = 0x00000001;
-    // =========================================================================
 
-    // =========================================================================
-    // RENAME SELECTION
-    // 0 — the stem only ("report" in "report.txt"), so Del or the first typed
-    //     character replaces the part that actually changes.
-    // 1 — the whole name including the extension.
+    // 0 — stem only ("report" in "report.txt"). 1 — whole name including extension.
     // Pressing the rename hotkey again while the box is open switches between them.
-    // =========================================================================
     private int _renameSelectionMode;
+    private bool _renameScrollHooked;
 
     private void HandleF2Rename()
     {
         if (lvFiles.SelectedItem is not FileEntry entry || entry.Name == "..") return;
 
         // Already editing this row: only switch the selection.
-        // This must NOT go through SelectRenameText, which resets box.Text and
-        // would throw away whatever the user has typed so far.
+        // Must NOT go through SelectRenameText, which resets box.Text.
         if (_renamingEntry != null && ReferenceEquals(_renamingEntry, entry))
         {
             CycleRenameSelection();
@@ -50,64 +42,79 @@ public partial class FilePaneControl
         BeginRename(false);
     }
 
-    private void BeginRename(bool selectAll)
+    private void BeginRename(bool selectAll, bool caretAfterStem = false)
     {
         _renameClickTimer?.Stop();
         if (lvFiles.SelectedItem is not FileEntry entry || entry.Name == "..") return;
         if (_renamingEntry != null) return;
-
-        // A pane in the middle of a listing is about to replace every row,
-        // including the one being edited
         if (_isBusy) return;
 
         _renamingEntry = entry;
-        entry.IsEditing = true;
-        lvFiles.UpdateLayout();
+        lvFiles.ScrollIntoView(entry);
 
-        _ = Dispatcher.BeginInvoke(new Action(() => SelectRenameText(entry, selectAll)), System.Windows.Threading.DispatcherPriority.Input);
+        // Removed synchronous lvFiles.UpdateLayout() which caused UI stutters.
+        // Dispatcher guarantees the virtualizing panel will realize the item naturally.
+        _ = Dispatcher.BeginInvoke(
+            new Action(() => SelectRenameText(entry, selectAll, caretAfterStem)),
+            System.Windows.Threading.DispatcherPriority.Input);
     }
 
-    // Attaches the rename box for a freshly opened editor and applies the initial
-    // selection. Resets the text, so it is only for opening the editor.
-    private void SelectRenameText(FileEntry entry, bool selectAll)
+    // Opens the pane-level overlay over the name cell. txtName stays visible
+    // so the overlay can be re-measured on scroll; the opaque border covers it.
+    private void SelectRenameText(FileEntry entry, bool selectAll, bool caretAfterStem = false)
     {
-        if (lvFiles.ItemContainerGenerator.ContainerFromItem(entry) is not ListViewItem container) return;
-        if (FindDescendant<TextBox>(container, "txtRename") is not TextBox box) return;
+        if (!ReferenceEquals(_renamingEntry, entry)) return;
 
-        _renameBox = box;
-        box.Text = entry.Name;
+        if (!TryGetRenameRect(entry, out Rect rect))
+        {
+            CancelRename();
+            return;
+        }
 
+        ApplyRenameOverlay(rect);
+        pnlRename.UpdateLayout();
+
+        _renameBox = txtRenameOverlay;
+        txtRenameOverlay.Text = entry.Name;
         _renameSelectionMode = selectAll ? 1 : 0;
 
-        box.Focus();
-        Keyboard.Focus(box);
+        AttachRenameScrollWatch();
 
-        ApplyRenameSelection(box, entry);
+        _ = Dispatcher.BeginInvoke(new Action(() =>
+        {
+            if (!ReferenceEquals(_renamingEntry, entry) || _renameBox != txtRenameOverlay) return;
+            txtRenameOverlay.Focus();
+            Keyboard.Focus(txtRenameOverlay);
+            if (caretAfterStem)
+            {
+                // Mouse rename: caret right before the extension ("report|.txt"),
+                // since it is almost always the name that gets edited
+                string text = txtRenameOverlay.Text ?? "";
+                txtRenameOverlay.Select(GetStemLength(text, entry.IsFolder), 0);
+            }
+            else
+                ApplyRenameSelection(txtRenameOverlay, entry);
+        }), System.Windows.Threading.DispatcherPriority.Input);
     }
 
-    // Repeated hotkey press while the editor is open. Text is left untouched.
     private void CycleRenameSelection()
     {
         var box = _renameBox;
         var entry = _renamingEntry;
         if (box == null || entry == null) return;
 
-        // Two modes. For a Total Commander style three-step cycle
-        // (stem -> extension -> everything) raise the modulus to 3 and add the
-        // extension branch in ApplyRenameSelection.
+        // Two modes. For a TC-style three-step cycle (stem -> extension -> all)
+        // raise the modulus to 3 and add the extension branch in ApplyRenameSelection.
         _renameSelectionMode = (_renameSelectionMode + 1) % 2;
 
         box.Focus();
         Keyboard.Focus(box);
-
         ApplyRenameSelection(box, entry);
     }
 
     private void ApplyRenameSelection(TextBox box, FileEntry entry)
     {
         string text = box.Text ?? string.Empty;
-
-        // Creating a new item: the field is empty, there is nothing to select
         if (text.Length == 0)
         {
             box.CaretIndex = 0;
@@ -115,44 +122,125 @@ public partial class FilePaneControl
         }
 
         int stemLength = GetStemLength(text, entry.IsFolder);
-
         if (_renameSelectionMode == 0 && stemLength > 0 && stemLength < text.Length)
             box.Select(0, stemLength);
         else
             box.SelectAll();
     }
 
-    // =========================================================================
-    // How much of the name counts as "the part you usually retype".
-    //
-    // Folders: everything. A folder called "v1.2" or "node_modules.bak" has no
-    // extension, and treating ".2" as one would leave the user editing half a
-    // name — Explorer selects folder names whole for exactly this reason.
-    //
-    // Files starting with a dot (".gitignore", ".env"): everything as well,
-    // since there is no stem in front of the dot to select.
-    //
-    // "archive.tar.gz" resolves to "archive.tar", because the extension is what
-    // follows the last dot. Same as Explorer.
-    // =========================================================================
+    // Folders and dotfiles have no stem. "archive.tar.gz" uses the last dot, same as Explorer.
     private static int GetStemLength(string name, bool isFolder)
     {
         if (isFolder) return name.Length;
-
         int lastDot = name.LastIndexOf('.');
-        if (lastDot <= 0) return name.Length;
+        return lastDot <= 0 ? name.Length : lastDot;
+    }
 
-        return lastDot;
+    private bool TryGetRenameRect(FileEntry entry, out Rect rect)
+    {
+        rect = default;
+        if (lvFiles.ItemContainerGenerator.ContainerFromItem(entry) is not ListViewItem container)
+            return false;
+
+        Point origin = container.TranslatePoint(new Point(0, 0), grdListArea);
+        double x, y, h;
+
+        var nameBlock = FindDescendant<TextBlock>(container, "txtName");
+        if (nameBlock != null)
+        {
+            Point p = nameBlock.TranslatePoint(new Point(-4, -2), grdListArea);
+            x = p.X;
+            y = p.Y;
+            h = Math.Max(nameBlock.ActualHeight + 4, container.ActualHeight > 1 ? container.ActualHeight : 22);
+        }
+        else
+        {
+            double iconSlot = 22;
+            if (TryFindResource("AppFileIconSize") is double iconSize && iconSize > 0)
+                iconSlot = iconSize + 10;
+
+            x = origin.X + container.Padding.Left + iconSlot;
+            y = origin.Y;
+            h = container.ActualHeight > 1 ? container.ActualHeight : 22;
+        }
+
+        double w = 80;
+        if (lvFiles.View is GridView gv && gv.Columns.Count > 0 && gv.Columns[0].ActualWidth > 0)
+            w = Math.Max(80, origin.X + gv.Columns[0].ActualWidth - x - 8);
+
+        rect = new Rect(x, y, w, h);
+        return true;
+    }
+
+    private void ApplyRenameOverlay(Rect rect)
+    {
+        Canvas.SetLeft(pnlRename, rect.X);
+        Canvas.SetTop(pnlRename, rect.Y);
+        pnlRename.Width = rect.Width;
+        pnlRename.Height = Math.Max(rect.Height, 18);
+        pnlRename.Visibility = Visibility.Visible;
+    }
+
+    private void HideRenameOverlay()
+    {
+        DetachRenameScrollWatch();
+        if (pnlRename.Visibility != Visibility.Collapsed)
+            pnlRename.Visibility = Visibility.Collapsed;
+    }
+
+    private void AttachRenameScrollWatch()
+    {
+        if (_renameScrollHooked) return;
+        lvFiles.AddHandler(ScrollViewer.ScrollChangedEvent, RenameScrollHandler, true);
+        _renameScrollHooked = true;
+    }
+
+    private void DetachRenameScrollWatch()
+    {
+        if (!_renameScrollHooked) return;
+        lvFiles.RemoveHandler(ScrollViewer.ScrollChangedEvent, RenameScrollHandler);
+        _renameScrollHooked = false;
+    }
+
+    private ScrollChangedEventHandler RenameScrollHandler =>
+        _renameScrollHandlerField ??= OnRenameScrollChanged;
+
+    private ScrollChangedEventHandler? _renameScrollHandlerField;
+
+    private void OnRenameScrollChanged(object sender, ScrollChangedEventArgs e)
+    {
+        if (_renamingEntry == null || _renameInProgress) return;
+        if (e.VerticalChange == 0 && e.HorizontalChange == 0) return;
+
+        if (lvFiles.ItemContainerGenerator.ContainerFromItem(_renamingEntry) is not ListViewItem)
+        {
+            CommitActiveRename();
+            return;
+        }
+
+        if (!TryGetRenameRect(_renamingEntry, out Rect rect) ||
+            rect.Y + rect.Height < 0 ||
+            rect.Y > grdListArea.ActualHeight)
+        {
+            CommitActiveRename();
+            return;
+        }
+
+        ApplyRenameOverlay(rect);
     }
 
     private async void RenameBox_KeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Enter) { e.Handled = true; if (sender is TextBox box) await CommitRenameAsync(box); }
-        else if (e.Key == Key.Escape) { e.Handled = true; CancelRename(); }
-
-        // Fallback for the case where the pane no longer sees F2 once the focus
-        // sits inside the text box. Harmless if the pane handler already ran:
-        // the mode simply switches once, here or there, never twice.
+        if (e.Key == Key.Enter)
+        {
+            e.Handled = true;
+            if (sender is TextBox box) await CommitRenameAsync(box);
+        }
+        else if (e.Key == Key.Escape)
+        {
+            e.Handled = true;
+            CancelRename();
+        }
         else if (e.Key == Key.F2 && !e.Handled)
         {
             e.Handled = true;
@@ -173,242 +261,277 @@ public partial class FilePaneControl
         try
         {
             var entry = _renamingEntry;
+            string newName = box.Text.Trim();
+            bool isCreatingNew = entry.FullPath == ":::NEW:::";
+            string oldPath = entry.FullPath;
+
+            // Hide first so LostFocus from collapsing the overlay is a no-op
+            // (this method is already in flight via _renameInProgress).
             _renamingEntry = null;
             _renameBox = null;
             entry.IsEditing = false;
+            HideRenameOverlay();
 
-            string oldPath = entry.FullPath;
-            string newName = box.Text.Trim();
-            bool isCreatingNew = oldPath == ":::NEW:::";
-
-            if (string.IsNullOrEmpty(newName) || (!isCreatingNew && string.Equals(newName, entry.Name, StringComparison.Ordinal)))
+            if (string.IsNullOrEmpty(newName) ||
+                (!isCreatingNew && string.Equals(newName, entry.Name, StringComparison.Ordinal)))
             {
-                if (isCreatingNew) { Items.Remove(entry); FocusPanel(); }
-                else RestoreRowFocus(entry);
+                AbortRenameUi(entry, isCreatingNew);
                 return;
             }
 
             if (newName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
             {
                 MessageDialog.Show(Window.GetWindow(this), "Invalid file name.", isCreatingNew ? "Create" : "Rename");
-                if (isCreatingNew) { Items.Remove(entry); FocusPanel(); }
-                else RestoreRowFocus(entry);
+                AbortRenameUi(entry, isCreatingNew);
                 return;
             }
 
-            // Handle special case: rename saved SSH session connection name
-            if (CurrentPath.Equals(@"\\Network\", StringComparison.OrdinalIgnoreCase) && !isCreatingNew)
+            if (CurrentPath.Equals(@"\\Network\", StringComparison.OrdinalIgnoreCase) &&
+                !isCreatingNew &&
+                oldPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
             {
-                if (oldPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
-                {
-                    try
-                    {
-                        var settings = (Window.GetWindow(this) as MainWindow)?.AppSettings ?? AppSettings.Load();
-                        var session = settings.SshSessions.FirstOrDefault(s =>
-                            s.Name.Equals(entry.Name, StringComparison.OrdinalIgnoreCase) ||
-                            $"{s.Username}@{s.Host}".Equals(entry.Name, StringComparison.OrdinalIgnoreCase));
-
-                        if (session != null)
-                        {
-                            if (settings.SshSessions.Any(s => string.Equals(s.Name, newName, StringComparison.OrdinalIgnoreCase)))
-                            {
-                                MessageDialog.Show(Window.GetWindow(this), $"A session named \"{newName}\" already exists.", "Rename");
-                                RestoreRowFocus(entry);
-                                return;
-                            }
-
-                            Providers.SshFileSystemProvider.CloseConnection(entry.Name);
-                            session.Name = newName;
-                            settings.Save();
-                            await NavigateAsync(CurrentPath, newName);
-                            DirectoryModified?.Invoke(this, EventArgs.Empty);
-                        }
-                        else RestoreRowFocus(entry);
-                    }
-                    catch (Exception ex)
-                    {
-                        MessageDialog.Show(Window.GetWindow(this), $"Cannot rename session:\n{ex.Message}", "Rename Error");
-                        RestoreRowFocus(entry);
-                    }
-                    return;
-                }
+                await RenameSshSessionAsync(entry, newName);
+                return;
             }
 
             var provider = FileSystemFactory.GetProvider(CurrentPath);
             string dir = isCreatingNew ? CurrentPath : provider.GetParentPath(oldPath);
             string newPath = provider.CombinePaths(dir, newName);
 
-            // =========================================================================
-            // COLLISION HANDLING LOGIC
-            // =========================================================================
+            bool caseOnlyRename = !isCreatingNew &&
+                string.Equals(newName, entry.Name, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(newName, entry.Name, StringComparison.Ordinal);
+
             bool handledAtomicallyByWin32 = false;
 
-            if (provider.Exists(newPath))
+            if (!caseOnlyRename && await Task.Run(() => provider.Exists(newPath)))
             {
-                var targetItem = Items.FirstOrDefault(i => string.Equals(i.Name, newName, StringComparison.OrdinalIgnoreCase));
-                bool isTargetFolder = false;
-
-                if (targetItem != null)
-                {
-                    isTargetFolder = targetItem.IsFolder;
-                }
-                else
-                {
-                    if (!CurrentPath.StartsWith(@"\\Network", StringComparison.OrdinalIgnoreCase))
-                        isTargetFolder = Directory.Exists(newPath);
-                    else
-                    {
-                        var (testEntries, testErr) = await provider.ReadDirectoryAsync(newPath);
-                        isTargetFolder = testErr == null && testEntries != null;
-                    }
-                }
-
-                bool canOverwrite = !isCreatingNew;
-
-                // Ensure folders are empty before allowing overwrite
-                if (canOverwrite && isTargetFolder)
-                {
-                    var (targetEntries, err) = await provider.ReadDirectoryAsync(newPath);
-                    if (err == null && targetEntries != null)
-                        canOverwrite = !targetEntries.Any(e => e.Name != "..");
-                    else
-                        canOverwrite = false;
-                }
-
-                var conflictDialog = new RenameConflictDialog(newName, isTargetFolder, canOverwrite)
-                {
-                    Owner = Window.GetWindow(this)
-                };
-
-                conflictDialog.ShowDialog();
-
-                if (conflictDialog.Result == RenameConflictResult.Rename)
-                {
-                    _renamingEntry = entry;
-                    entry.IsEditing = true;
-                    lvFiles.UpdateLayout();
-
-                    // Whole name selected: the user came back specifically to type
-                    // a different one, so nothing should be kept
-                    _ = Dispatcher.BeginInvoke(new Action(() => SelectRenameText(entry, true)), System.Windows.Threading.DispatcherPriority.Input);
-                    return;
-                }
-                else if (conflictDialog.Result == RenameConflictResult.Overwrite)
-                {
-                    bool isLocal = !CurrentPath.StartsWith(@"\\Network", StringComparison.OrdinalIgnoreCase);
-
-                    // ===================================================================
-                    // ATOMIC OVERWRITE VIA WIN32 API
-                    // Used exclusively for local files (not directories or SSH sessions).
-                    // ===================================================================
-                    if (isLocal && !isTargetFolder && !isCreatingNew)
-                    {
-                        if (!MoveFileEx(oldPath, newPath, MOVEFILE_REPLACE_EXISTING))
-                        {
-                            int error = Marshal.GetLastWin32Error();
-                            MessageDialog.Show(Window.GetWindow(this), $"Win32 Kernel atomic overwrite failed.\nError code: {error}", "Overwrite Error");
-                            RestoreRowFocus(entry);
-                            return;
-                        }
-                        handledAtomicallyByWin32 = true;
-                    }
-                    else
-                    {
-                        // ===================================================================
-                        // FALLBACK DELETION FOR DIRECTORIES AND NETWORK PATHS
-                        // ===================================================================
-                        try
-                        {
-                            if (isLocal)
-                            {
-                                try
-                                {
-                                    if (Directory.Exists(newPath))
-                                    {
-                                        var di = new DirectoryInfo(newPath);
-                                        di.Attributes &= ~FileAttributes.ReadOnly;
-                                    }
-                                    else if (File.Exists(newPath))
-                                    {
-                                        File.SetAttributes(newPath, FileAttributes.Normal);
-                                    }
-                                }
-                                catch { }
-                            }
-
-                            int deleteRetries = 3;
-                            while (true)
-                            {
-                                try
-                                {
-                                    await provider.DeleteAsync(newPath);
-                                    break;
-                                }
-                                catch (Exception ex) when ((ex is UnauthorizedAccessException || ex is IOException) && deleteRetries > 0)
-                                {
-                                    deleteRetries--;
-                                    await Task.Delay(150);
-                                }
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            MessageDialog.Show(Window.GetWindow(this), $"Cannot delete existing item to overwrite:\n{ex.Message}", "Overwrite Error");
-                            if (isCreatingNew) { Items.Remove(entry); FocusPanel(); }
-                            else RestoreRowFocus(entry);
-                            return;
-                        }
-                    }
-                }
-                else // Cancel
-                {
-                    if (isCreatingNew) { Items.Remove(entry); FocusPanel(); }
-                    else RestoreRowFocus(entry);
-                    return;
-                }
+                var conflict = await ResolveRenameConflict(entry, provider, newName, newPath, isCreatingNew);
+                if (conflict == ConflictAction.Abort) return;
+                if (conflict == ConflictAction.Reedit) return;
+                if (conflict == ConflictAction.AtomicWin32) handledAtomicallyByWin32 = true;
             }
 
             try
             {
-                // Skip standard provider rename if already handled atomically by Win32
+                // On the thread pool: over SSH each of these is a network round
+                // trip, and running them here froze the window until it finished
                 if (!handledAtomicallyByWin32)
                 {
                     if (isCreatingNew)
                     {
-                        if (entry.IsFolder) provider.CreateDirectory(newPath);
-                        else provider.CreateFile(newPath);
+                        await Task.Run(() =>
+                        {
+                            if (entry.IsFolder) provider.CreateDirectory(newPath);
+                            else provider.CreateFile(newPath);
+                        });
                     }
                     else
                     {
-                        int renameRetries = 3;
-                        while (true)
-                        {
-                            try
-                            {
-                                provider.Rename(oldPath, newPath);
-                                break;
-                            }
-                            catch (Exception ex) when ((ex is UnauthorizedAccessException || ex is IOException) && renameRetries > 0)
-                            {
-                                renameRetries--;
-                                await Task.Delay(150);
-                            }
-                        }
+                        await RetryIo(() => Task.Run(() => provider.Rename(oldPath, newPath)));
                     }
                 }
             }
             catch (Exception ex)
             {
-                MessageDialog.Show(Window.GetWindow(this), $"Cannot {(isCreatingNew ? "create" : "rename")}:\n{ex.Message}", isCreatingNew ? "Create" : "Rename");
-                if (isCreatingNew) { Items.Remove(entry); FocusPanel(); }
-                else RestoreRowFocus(entry);
+                MessageDialog.Show(Window.GetWindow(this),
+                    $"Cannot {(isCreatingNew ? "create" : "rename")}:\n{ex.Message}",
+                    isCreatingNew ? "Create" : "Rename");
+                AbortRenameUi(entry, isCreatingNew);
                 return;
             }
 
             await NavigateAsync(CurrentPath, newName);
             DirectoryModified?.Invoke(this, EventArgs.Empty);
+
+            _ = Dispatcher.BeginInvoke(
+                new Action(FocusPanel),
+                System.Windows.Threading.DispatcherPriority.Loaded);
         }
         finally { _renameInProgress = false; }
+    }
+
+    private enum ConflictAction { Continue, AtomicWin32, Reedit, Abort }
+
+    private async Task<ConflictAction> ResolveRenameConflict(
+        FileEntry entry, IFileSystemProvider provider,
+        string newName, string newPath, bool isCreatingNew)
+    {
+        var targetItem = Items.FirstOrDefault(i =>
+            string.Equals(i.Name, newName, StringComparison.OrdinalIgnoreCase));
+
+        // Only the local disk provider may be handled with Win32 calls. The old
+        // test ("not under \\Network") also took ssh:// paths for local, so an
+        // overwrite on SSH went to MoveFileEx with an ssh:// path and always failed.
+        bool isLocal = provider is LocalDiskProvider;
+
+        bool isTargetFolder = targetItem != null
+            ? targetItem.IsFolder
+            : isLocal
+                ? Directory.Exists(newPath)
+                : await IsRemoteDirectory(provider, newPath);
+
+        bool canOverwrite = !isCreatingNew;
+        if (canOverwrite && isTargetFolder)
+        {
+            var (targetEntries, err) = await provider.ReadDirectoryAsync(newPath);
+            canOverwrite = err == null && targetEntries != null && !targetEntries.Any(e => e.Name != "..");
+        }
+
+        var conflictDialog = new RenameConflictDialog(newName, isTargetFolder, canOverwrite)
+        {
+            Owner = Window.GetWindow(this)
+        };
+        conflictDialog.ShowDialog();
+
+        if (conflictDialog.Result == RenameConflictResult.Rename)
+        {
+            _renamingEntry = entry;
+            lvFiles.UpdateLayout();
+            _ = Dispatcher.BeginInvoke(
+                new Action(() => SelectRenameText(entry, true)),
+                System.Windows.Threading.DispatcherPriority.Input);
+            return ConflictAction.Reedit;
+        }
+
+        if (conflictDialog.Result != RenameConflictResult.Overwrite)
+        {
+            AbortRenameUi(entry, isCreatingNew);
+            return ConflictAction.Abort;
+        }
+
+        if (isLocal && !isTargetFolder && !isCreatingNew)
+        {
+            if (!MoveFileEx(entry.FullPath, newPath, MOVEFILE_REPLACE_EXISTING))
+            {
+                int error = Marshal.GetLastWin32Error();
+                MessageDialog.Show(Window.GetWindow(this),
+                    $"Win32 Kernel atomic overwrite failed.\nError code: {error}", "Overwrite Error");
+                RestoreRowFocus(entry);
+                return ConflictAction.Abort;
+            }
+            return ConflictAction.AtomicWin32;
+        }
+
+        var (deleted, deleteError) = await TryDeleteForOverwrite(provider, newPath, isLocal);
+        if (!deleted)
+        {
+            MessageDialog.Show(Window.GetWindow(this),
+                $"Cannot delete existing item to overwrite:\n{deleteError}", "Overwrite Error");
+            AbortRenameUi(entry, isCreatingNew);
+            return ConflictAction.Abort;
+        }
+
+        return ConflictAction.Continue;
+    }
+
+    private async Task RenameSshSessionAsync(FileEntry entry, string newName)
+    {
+        try
+        {
+            var settings = (Window.GetWindow(this) as MainWindow)?.AppSettings ?? AppSettings.Load();
+            var session = settings.SshSessions.FirstOrDefault(s =>
+                s.Name.Equals(entry.Name, StringComparison.OrdinalIgnoreCase) ||
+                $"{s.Username}@{s.Host}".Equals(entry.Name, StringComparison.OrdinalIgnoreCase));
+
+            if (session == null)
+            {
+                RestoreRowFocus(entry);
+                return;
+            }
+
+            if (settings.SshSessions.Any(s => string.Equals(s.Name, newName, StringComparison.OrdinalIgnoreCase)))
+            {
+                MessageDialog.Show(Window.GetWindow(this),
+                    $"A session named \"{newName}\" already exists.", "Rename");
+                RestoreRowFocus(entry);
+                return;
+            }
+
+            Providers.SshFileSystemProvider.CloseConnection(entry.Name);
+            session.Name = newName;
+            settings.Save();
+            await NavigateAsync(CurrentPath, newName);
+            DirectoryModified?.Invoke(this, EventArgs.Empty);
+
+            _ = Dispatcher.BeginInvoke(
+                new Action(FocusPanel),
+                System.Windows.Threading.DispatcherPriority.Loaded);
+        }
+        catch (Exception ex)
+        {
+            MessageDialog.Show(Window.GetWindow(this), $"Cannot rename session:\n{ex.Message}", "Rename Error");
+            RestoreRowFocus(entry);
+        }
+    }
+
+    private static async Task<bool> IsRemoteDirectory(IFileSystemProvider provider, string path)
+    {
+        var (testEntries, testErr) = await provider.ReadDirectoryAsync(path);
+        return testErr == null && testEntries != null;
+    }
+
+    private static async Task<(bool Ok, string? Error)> TryDeleteForOverwrite(
+        IFileSystemProvider provider, string newPath, bool isLocal)
+    {
+        try
+        {
+            if (isLocal)
+            {
+                try
+                {
+                    if (Directory.Exists(newPath))
+                    {
+                        var di = new DirectoryInfo(newPath);
+                        di.Attributes &= ~FileAttributes.ReadOnly;
+                    }
+                    else if (File.Exists(newPath))
+                    {
+                        File.SetAttributes(newPath, FileAttributes.Normal);
+                    }
+                }
+                catch { }
+            }
+
+            await RetryIo(async () => await provider.DeleteAsync(newPath));
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    private static async Task RetryIo(Func<Task> action)
+    {
+        int retries = 3;
+        while (true)
+        {
+            try
+            {
+                await action();
+                return;
+            }
+            catch (Exception ex) when ((ex is UnauthorizedAccessException || ex is IOException) && retries > 0)
+            {
+                retries--;
+                await Task.Delay(150);
+            }
+        }
+    }
+
+    private void AbortRenameUi(FileEntry entry, bool isCreatingNew)
+    {
+        HideRenameOverlay();
+        if (isCreatingNew)
+        {
+            Items.Remove(entry);
+            FocusPanel();
+        }
+        else
+        {
+            RestoreRowFocus(entry);
+        }
     }
 
     private void CancelRename()
@@ -419,6 +542,7 @@ public partial class FilePaneControl
         _renameBox = null;
         _renameSelectionMode = 0;
         entry.IsEditing = false;
+        HideRenameOverlay();
 
         if (entry.FullPath == ":::NEW:::")
         {
@@ -434,13 +558,18 @@ public partial class FilePaneControl
     private void RestoreRowFocus(FileEntry entry)
     {
         lvFiles.UpdateLayout();
-        if (lvFiles.ItemContainerGenerator.ContainerFromItem(entry) is ListViewItem container) container.Focus();
-        else lvFiles.Focus();
+        if (lvFiles.ItemContainerGenerator.ContainerFromItem(entry) is ListViewItem container)
+            container.Focus();
+        else
+            lvFiles.Focus();
     }
 
     private bool ClickInsideRenameBox(MouseButtonEventArgs e)
     {
-        return _renameBox != null && e.OriginalSource is DependencyObject d && FindAncestor<TextBox>(d) is TextBox tb && ReferenceEquals(tb, _renameBox);
+        return _renameBox != null
+            && e.OriginalSource is DependencyObject d
+            && FindAncestor<TextBox>(d) is TextBox tb
+            && ReferenceEquals(tb, _renameBox);
     }
 
     private void CommitActiveRename()
@@ -449,23 +578,14 @@ public partial class FilePaneControl
         else CancelRename();
     }
 
-    // =========================================================================
-    // Rename by a slow second click is a familiar gesture for real files, but it
-    // must not apply to the virtual entries in the Network root: a double click
-    // there opens an SSH connection, which takes seconds, and a pending rename
-    // timer would fire in the middle of it. Missing the system double click
-    // threshold by a few milliseconds was enough to land in the edit box instead
-    // of the session.
-    //
-    // Those entries are renamed with F2 or Shift+F6, and Alt+Enter opens the full
-    // session editor — host, port, user and key, not just the name.
-    // =========================================================================
+    // Slow second click must not fire on Network root rows: a double-click
+    // there opens a session, and a pending timer would drop the user into rename.
+    // Files INSIDE an SSH folder are ordinary files: their ssh:// paths used to
+    // be blocked here too, so they could only be renamed with F2.
     private bool IsMouseRenameAllowed(FileEntry item)
     {
         if (CurrentPath.StartsWith(@"\\Network", StringComparison.OrdinalIgnoreCase)) return false;
-        if (item.FullPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase)) return false;
         if (item.FullPath == ":::ADD_SSH:::") return false;
-
         return true;
     }
 
@@ -476,18 +596,18 @@ public partial class FilePaneControl
 
         if (_isBusy || !IsMouseRenameAllowed(item)) return;
 
-        var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(GetDoubleClickTime() + 250) };
+        var timer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(GetDoubleClickTime() + 250)
+        };
         _renameClickTimer = timer;
-        timer.Tick += (s, ev) =>
+        timer.Tick += (_, _) =>
         {
             timer.Stop();
             if (ReferenceEquals(_renameClickTimer, timer)) _renameClickTimer = null;
-
-            // A navigation may have started between the click and this tick
             if (_isBusy || _renamingEntry != null) return;
             if (!ReferenceEquals(lvFiles.SelectedItem, item)) return;
-
-            BeginRename(false);
+            BeginRename(false, true);
         };
         timer.Start();
     }
@@ -507,7 +627,7 @@ public partial class FilePaneControl
             Name = "",
             IsFolder = isFolder,
             FullPath = ":::NEW:::",
-            IsEditing = true
+            IsEditing = false
         };
 
         int insertIdx = Items.Count > 0 && Items[0].Name == ".." ? 1 : 0;
@@ -515,12 +635,15 @@ public partial class FilePaneControl
 
         lvFiles.SelectedItem = newEntry;
         lvFiles.ScrollIntoView(newEntry);
-
         _renamingEntry = newEntry;
         lvFiles.UpdateLayout();
 
-        _ = Dispatcher.BeginInvoke(new Action(() => SelectRenameText(newEntry, false)), System.Windows.Threading.DispatcherPriority.Input);
+        _ = Dispatcher.BeginInvoke(
+            new Action(() => SelectRenameText(newEntry, false)),
+            System.Windows.Threading.DispatcherPriority.Input);
     }
+
+
 
     public void RequestRename() => HandleF2Rename();
 }

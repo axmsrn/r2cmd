@@ -24,26 +24,30 @@ public partial class MainWindow : Window
     // A pane is capturing the mouse (right button drag selection). Cursor only.
     private bool _panePointerBusy;
 
-    // =========================================================================
-    // CRITICAL FIX: Global Status Lock
-    // Prevents panes from overwriting important background progress messages
-    // =========================================================================
-    public bool IsStatusLocked { get; set; } = false;
+    public enum StatusPriority { Default = 0, Zoom = 1, Operation = 2 }
+    private readonly string?[] _statusState = new string?[3];
 
     // =========================================================================
-    // ZOOM INDICATOR STATE
-    // While the indicator is up it owns the status bar: a folder change or any
-    // other routine message is stored instead of being displayed, and appears
-    // once the indicator times out on its own.
+    // CRITICAL FIX: Global Status Lock
+    // Mapped to the priority queue for backward compatibility with older operation code.
+    // Setting this to false automatically clears the operation-level message.
     // =========================================================================
-    private bool _zoomIndicatorActive;
-    private string? _statusBehindZoom;
+    public bool IsStatusLocked
+    {
+        get => _statusState[(int)StatusPriority.Operation] != null;
+        set
+        {
+            if (!value) UpdateStatus(null, StatusPriority.Operation);
+        }
+    }
+
     private System.Windows.Threading.DispatcherTimer? _zoomSaveTimer;
 
     // Global memory to store the last deeply navigated path for each root drive letter
     private readonly Dictionary<string, string> _driveHistory = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<FilePaneControl, HashSet<string>> _paneOpenedSessions = new();
+    private readonly Dictionary<FilePaneControl, HashSet<string>> _paneOpenedTerminals = new();
     private FilePaneControl _activePane;
-
     // Dynamically returns the pane that is currently NOT active
     private FilePaneControl _inactivePane => _activePane == leftPane ? rightPane : leftPane;
 
@@ -94,8 +98,13 @@ public partial class MainWindow : Window
 
     public MainWindow()
     {
-        InitializeComponent();
+        // Settings first: the render mode must be chosen before the window exists
         _settings = AppSettings.Load();
+
+        if (!_settings.HardwareRendering)
+            RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly;
+
+        InitializeComponent();
 
         // Placement is applied before the window is shown, otherwise it would
         // visibly jump from the XAML position to the restored one
@@ -223,24 +232,9 @@ public partial class MainWindow : Window
 
         ZoomManager.Attach(this, text =>
         {
-            // A copy or delete owns the status bar while it runs
-            if (IsStatusLocked) return;
-
-            if (text != null)
-            {
-                // Remember what was there only on the first step of a series,
-                // otherwise the second Ctrl+Plus would "remember" the indicator
-                if (!_zoomIndicatorActive) _statusBehindZoom = statusText.Text;
-
-                _zoomIndicatorActive = true;
-                statusText.Text = text;
-            }
-            else
-            {
-                _zoomIndicatorActive = false;
-                statusText.Text = _statusBehindZoom ?? "Ready.";
-                _statusBehindZoom = null;
-            }
+            // The priority queue naturally handles hiding the zoom overlay during
+            // an active operation, and restoring the background default message when done.
+            UpdateStatus(text, StatusPriority.Zoom);
         });
     }
 
@@ -297,6 +291,32 @@ public partial class MainWindow : Window
         };
     }
 
+    private void HookTerminalSplitter()
+    {
+        bottomTerminalSplitter.PreviewMouseLeftButtonDown += (s, e) =>
+        {
+            if (e.ClickCount != 2) return;
+
+            // Double click resets the terminal to the default 250px height
+            if (rowTerminal.Height.Value > 0)
+            {
+                rowTerminal.Height = new GridLength(250);
+                SetStatus("Terminal height: 250px (Default)");
+            }
+            e.Handled = true;
+        };
+
+        bottomTerminalSplitter.DragDelta += (s, e) =>
+        {
+            if (rowTerminal.Height.Value > 0)
+            {
+                // Show current height in pixels during drag
+                int height = (int)rowTerminal.Height.Value;
+                SetStatus($"Terminal height: {height}px");
+            }
+        };
+    }
+
     private void ResetPaneSplit(GridSplitter splitter)
     {
         if (VisualTreeHelper.GetParent(splitter) is not Grid grid) return;
@@ -344,7 +364,12 @@ public partial class MainWindow : Window
         pane.SortColumn = sortCol;
         pane.SortAscending = sortAsc;
 
-        pane.PaneGotFocus += (s, e) => _activePane = pane;
+        pane.PaneGotFocus += (s, e) =>
+        {
+            _activePane = pane;
+            // Sync terminal when switching focus between Left and Right panes (e.g. via Tab)
+            SyncGlobalTerminalDirectory();
+        };
 
         // Only update the global status bar if the message comes from the active pane
         pane.StatusMessage += (s, msg) =>
@@ -373,13 +398,57 @@ public partial class MainWindow : Window
         pane.PathChanged += (s, e) =>
         {
             string current = pane.CurrentPath;
-            if (!current.StartsWith(@"\\"))
+
+            ApplyKnownFolderSizes(pane);
+
+            // TRACK SSH ROOTS: Save deep paths for SSH sessions so we can return to them.
+            if (current.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
+            {
+                string? sessionName = SshSessionOf(current);
+                if (sessionName != null)
+                {
+                    _driveHistory[$"ssh://{sessionName}"] = current;
+
+                    if (pane.SuppressNextSftpBookmark)
+                    {
+                        pane.SuppressNextSftpBookmark = false;
+                    }
+                    else
+                    {
+                        if (!_paneOpenedSessions.TryGetValue(pane, out var opened))
+                        {
+                            opened = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                            _paneOpenedSessions[pane] = opened;
+                        }
+                        opened.Add(sessionName);
+                    }
+                }
+            }
+            else if (!current.StartsWith(@"\\"))
             {
                 string root = System.IO.Path.GetPathRoot(current) ?? "";
                 if (root != "") _driveHistory[root] = current;
             }
 
             UpdatePinnedSshSessions();
+            RefreshConnectionTabs();
+
+            // Sync terminal when navigating into a new folder (only if this pane is active)
+            if (pane == _activePane)
+            {
+                SyncGlobalTerminalDirectory();
+            }
+        };
+
+        pane.ConnectionTabsChanged += (s, e) =>
+        {
+            RememberPaneTerminal(pane);
+            RefreshConnectionTabs();
+        };
+
+        pane.ConnectionBookmarkClosed += (s, item) =>
+        {
+            HandleBookmarkClosed(pane, item);
         };
 
         // Resolves target path when a drive root (e.g. "D:\") is clicked in the UI
@@ -441,7 +510,7 @@ public partial class MainWindow : Window
         base.OnSourceInitialized(e);
 
         // FIXED: Title bar now requests color from current theme
-        Helpers.SetTitleBarTheme(this, ThemeManager.IsDarkTheme);
+        Helpers.SetTitleBarTheme(this, ThemeManager.IsDarkTheme, useSurfaceColor: true);
 
         // Hook into the Windows message loop to listen for OS-level events (like USB insertion)
         if (System.Windows.PresentationSource.FromVisual(this) is System.Windows.Interop.HwndSource source)
@@ -454,6 +523,7 @@ public partial class MainWindow : Window
         UpdateThemeIcon(btnTheme);
 
         HookSplitterReset();
+        HookTerminalSplitter();
     }
 
     // The same three lines used to sit in both OnSourceInitialized and the click handler
@@ -524,11 +594,10 @@ public partial class MainWindow : Window
                 Interval = TimeSpan.FromMilliseconds(500)
             };
 
-            _driveRefreshTimer.Tick += (s, e) =>
+            _driveRefreshTimer.Tick += async (s, e) =>
             {
                 _driveRefreshTimer!.Stop();
-                leftPane.InitDrives();
-                rightPane.InitDrives();
+                await RefreshDrivesAsync();
             };
         }
 
@@ -553,26 +622,36 @@ public partial class MainWindow : Window
 
         try
         {
-            leftPane.InitDrives();
-            rightPane.InitDrives();
+            Task drives = RefreshDrivesAsync();
 
-            string startLeft = IsValidStartPath(_settings.LastLeftPath)
-           ? _settings.LastLeftPath
-           : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-
-            string startRight = IsValidStartPath(_settings.LastRightPath)
-                ? _settings.LastRightPath
-                : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            // Off the UI thread: Directory.Exists on a disconnected network
+            // share blocks until the SMB timeout
+            string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var (startLeft, startRight) = await Task.Run(() => (
+                IsValidStartPath(_settings.LastLeftPath) ? _settings.LastLeftPath : home,
+                IsValidStartPath(_settings.LastRightPath) ? _settings.LastRightPath : home));
 
             await Task.WhenAll(leftPane.NavigateAsync(startLeft), rightPane.NavigateAsync(startRight));
 
             leftPane.UpdateColumnHeaders();
             rightPane.UpdateColumnHeaders();
+            RefreshConnectionTabs();
+
+            await drives;
         }
         catch (Exception ex)
         {
             SetStatus($"Initialization error: {ex.Message}");
         }
+    }
+
+    // DriveInfo.IsReady blocks on a dead network drive, so the scan runs in
+    // the background, once, and both panes get the same list
+    private async Task RefreshDrivesAsync()
+    {
+        var drives = await Task.Run(FilePaneControl.ScanDrives);
+        leftPane.ApplyDrives(drives);
+        rightPane.ApplyDrives(drives);
     }
 
     static bool IsValidStartPath(string? path)
@@ -609,6 +688,7 @@ public partial class MainWindow : Window
                 _settings.SshSessions.Add(dlg.Result);
                 _settings.Save();
                 await pane.RefreshAsync();
+                RefreshConnectionTabs();
                 SetStatus($"SSH Session '{dlg.Result.Name}' saved.");
             }
             return;
@@ -633,6 +713,18 @@ public partial class MainWindow : Window
                 catch
                 {
                     // Fallback to original path if target resolution fails due to permissions/network
+                }
+            }
+
+            // SMART SSH RESTORE: If opening an SSH session from the Network root,
+            // check if we have a deeper saved path in history and restore it.
+            if (pathToNavigate.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase) &&
+                pane.CurrentPath.StartsWith(@"\\Network", StringComparison.OrdinalIgnoreCase))
+            {
+                string? sessionName = SshSessionOf(pathToNavigate);
+                if (sessionName != null && _driveHistory.TryGetValue($"ssh://{sessionName}", out string? savedPath))
+                {
+                    pathToNavigate = savedPath;
                 }
             }
 
@@ -834,31 +926,30 @@ public partial class MainWindow : Window
         Mouse.OverrideCursor = (_busy || _panePointerBusy) ? Cursors.Wait : null;
 
     // =========================================================================
-    // CRITICAL FIX: The SetStatus method now respects the Lock
-    //
-    // It also respects the zoom indicator. Opening a folder raises a "Ready."
-    // message, which used to wipe the zoom percentage the moment it appeared.
-    // Routine messages are now kept aside and shown when the indicator expires;
-    // a forced message (operation progress) still wins and cancels it outright.
+    // Priority-based status machine. Replaces the brittle flag architecture.
+    // New code should call UpdateStatus directly. SetStatus is kept for
+    // backward compatibility with existing pane callbacks.
     // =========================================================================
     public void SetStatus(string text, bool forceUpdate = false)
     {
-        // If a background operation (like delete) is running, ignore normal updates
-        if (IsStatusLocked && !forceUpdate) return;
+        UpdateStatus(text, forceUpdate ? StatusPriority.Operation : StatusPriority.Default);
+    }
 
-        if (_zoomIndicatorActive)
+    public void UpdateStatus(string? text, StatusPriority priority)
+    {
+        _statusState[(int)priority] = text;
+
+        // Render highest priority message that currently exists
+        for (int i = _statusState.Length - 1; i >= 0; i--)
         {
-            if (!forceUpdate)
+            if (_statusState[i] != null)
             {
-                _statusBehindZoom = text;
+                statusText.Text = _statusState[i];
                 return;
             }
-
-            _zoomIndicatorActive = false;
-            _statusBehindZoom = null;
         }
 
-        statusText.Text = text;
+        statusText.Text = "Ready.";
     }
 
     // Same reasoning as the shortcuts window: shown non-modally so that a click
@@ -893,7 +984,7 @@ public partial class MainWindow : Window
         // Update OS-level title bar color for main window and any open child dialogs
         foreach (Window window in Application.Current.Windows)
         {
-            Helpers.SetTitleBarTheme(window, ThemeManager.IsDarkTheme);
+            Helpers.SetTitleBarTheme(window, ThemeManager.IsDarkTheme, useSurfaceColor: true);
         }
 
         if (sender is Button btn) UpdateThemeIcon(btn);
@@ -967,6 +1058,14 @@ public partial class MainWindow : Window
         _settings.LastLeftSortAscending = leftPane.SortAscending;
         _settings.LastRightSortColumn = rightPane.SortColumn;
         _settings.LastRightSortAscending = rightPane.SortAscending;
+
+        // Save the terminal height only if it is currently visible.
+        // If it's hidden (Height == 0), we keep the previously stored value intact.
+        if (bottomTerminalHost.Visibility == Visibility.Visible && rowTerminal.Height.Value > 0)
+        {
+            _settings.TerminalHeight = rowTerminal.Height.Value;
+        }
+
         try { _settings.Save(); } catch { }
     }
     // ===================== Search (Alt+F7) =====================
@@ -1019,5 +1118,260 @@ public partial class MainWindow : Window
         {
             SetStatus($"Clipboard error: {ex.Message}");
         }
+    }
+
+    // =========================================================================
+    // GLOBAL WINDOWS TERMINAL LOGIC
+    // =========================================================================
+    private void ToggleGlobalTerminal()
+    {
+        // If the active pane is currently showing an SSH path, toggle the embedded SSH terminal instead
+        if (_activePane != null && _activePane.CurrentPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
+        {
+            _activePane.ToggleSshTerminal();
+            RefreshConnectionTabs();
+            return;
+        }
+
+        if (bottomTerminalHost.Visibility == Visibility.Visible)
+        {
+            // Save the dynamically adjusted height to settings before collapsing the panel,
+            // so it is remembered if the user reopens the terminal within the same session.
+            if (rowTerminal.Height.Value > 0)
+            {
+                _settings.TerminalHeight = rowTerminal.Height.Value;
+            }
+
+            // Hide the terminal
+            bottomTerminalHost.Visibility = Visibility.Collapsed;
+            bottomTerminalSplitter.Visibility = Visibility.Collapsed;
+            rowTerminal.Height = new GridLength(0);
+
+            // Return focus to the active file pane
+            _activePane?.FocusPanel();
+        }
+        else
+        {
+            // Show the terminal
+            bottomTerminalHost.Visibility = Visibility.Visible;
+            bottomTerminalSplitter.Visibility = Visibility.Visible;
+
+            // Apply saved height, clamped to a maximum of 70% of the window height
+            // to prevent the terminal from hiding the file panels entirely on smaller screens.
+            if (rowTerminal.Height.Value <= 0)
+            {
+                double targetHeight = _settings.TerminalHeight > 0 ? _settings.TerminalHeight : 250;
+                double maxAllowed = this.ActualHeight * 0.7;
+
+                rowTerminal.Height = new GridLength(Math.Min(targetHeight, maxAllowed));
+            }
+
+            if (!globalTerminal.IsRunning)
+            {
+                // Start local terminal using the active pane's path
+                string? startPath = GetActiveLocalPath();
+
+                // Initialize the cache so it doesn't instantly send 'cd' again
+                _lastSyncedTerminalPath = startPath;
+
+                // Pass the path and null for the default shell (PowerShell)
+                globalTerminal.Start(startPath, null);
+
+                // Auto-hide when 'exit' is typed
+                globalTerminal.SessionExited -= GlobalTerminal_SessionExited;
+                globalTerminal.SessionExited += GlobalTerminal_SessionExited;
+            }
+            else
+            {
+                // If terminal is already running but was hidden, force a sync
+                // in case the user changed directories while it was closed
+                _lastSyncedTerminalPath = null;
+                SyncGlobalTerminalDirectory();
+            }
+
+            // Focus the terminal
+            _ = Dispatcher.BeginInvoke(new Action(() => globalTerminal.Focus()),
+                System.Windows.Threading.DispatcherPriority.Input);
+        }
+    }
+
+    private void GlobalTerminal_SessionExited(object? sender, EventArgs e)
+    {
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            if (bottomTerminalHost.Visibility == Visibility.Visible)
+            {
+                ToggleGlobalTerminal();
+            }
+        }));
+    }
+
+    private string? GetActiveLocalPath()
+    {
+        if (_activePane == null) return null;
+        string path = _activePane.CurrentPath;
+
+        // Ignore network roots and SSH paths (Windows Terminal cannot operate there)
+        if (string.IsNullOrEmpty(path) ||
+            path.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith(@"\\Network", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return System.IO.Directory.Exists(path) ? path : null;
+    }
+
+    // Track the last synced path to avoid spamming 'cd' when simply clicking files
+    private string? _lastSyncedTerminalPath;
+
+    private void SyncGlobalTerminalDirectory()
+    {
+        // Do not spam commands if the terminal is hidden or not running
+        if (bottomTerminalHost.Visibility != Visibility.Visible || !globalTerminal.IsRunning)
+            return;
+
+        string? localPath = GetActiveLocalPath();
+
+        // Only send the 'cd' command if the path has actually changed
+        if (localPath != null && !string.Equals(localPath, _lastSyncedTerminalPath, StringComparison.OrdinalIgnoreCase))
+        {
+            _lastSyncedTerminalPath = localPath;
+
+            // ChangeDirectory sends Escape and cd as two writes, after flushing
+            // any pending ConPTY resize. A single "\x1bcd ..." string is swallowed
+            // by PSReadLine as one CSI-like token.
+            globalTerminal.ChangeDirectory(localPath);
+        }
+    }
+
+    private void RefreshConnectionTabs()
+    {
+        leftPane.SetConnectionBookmarks(BuildPaneBookmarks(leftPane));
+        rightPane.SetConnectionBookmarks(BuildPaneBookmarks(rightPane));
+    }
+
+    private void RememberPaneTerminal(FilePaneControl pane)
+    {
+        string? name = SshSessionOf(pane.CurrentPath);
+        if (name == null) return;
+
+        if (!_paneOpenedTerminals.TryGetValue(pane, out var set))
+        {
+            set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _paneOpenedTerminals[pane] = set;
+        }
+
+        if (pane.IsTerminalVisible)
+            set.Add(name);
+        else if (!pane.IsTerminalRunning)
+            set.Remove(name);
+    }
+
+    private void HandleBookmarkClosed(FilePaneControl pane, ConnectionBookmark item)
+    {
+        if (item.IsTerminal)
+        {
+            if (_paneOpenedTerminals.TryGetValue(pane, out var terminals))
+                terminals.Remove(item.SessionName);
+        }
+        else if (_paneOpenedSessions.TryGetValue(pane, out var sessions))
+        {
+            sessions.Remove(item.SessionName);
+            pane.ForgetLastSshPath(item.SessionName);
+        }
+
+        bool paneHasSftp = _paneOpenedSessions.TryGetValue(pane, out var paneSftp)
+            && paneSftp.Count > 0;
+        bool paneHasSsh = _paneOpenedTerminals.TryGetValue(pane, out var paneSsh)
+            && paneSsh.Count > 0;
+
+        if (!paneHasSftp && !paneHasSsh &&
+            pane.CurrentPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
+        {
+            _ = pane.NavigateAsync(@"\\Network\");
+        }
+
+        bool stillUsed = false;
+        foreach (var other in new[] { leftPane, rightPane })
+        {
+            if (_paneOpenedSessions.TryGetValue(other, out var s) && s.Contains(item.SessionName))
+                stillUsed = true;
+            if (_paneOpenedTerminals.TryGetValue(other, out var t) && t.Contains(item.SessionName))
+                stillUsed = true;
+            if (other != pane &&
+                string.Equals(SshSessionOf(other.CurrentPath), item.SessionName, StringComparison.OrdinalIgnoreCase))
+                stillUsed = true;
+        }
+
+        if (!stillUsed)
+        {
+            try { Providers.SshFileSystemProvider.CloseConnection(item.SessionName); } catch { }
+            _driveHistory.Remove($"ssh://{item.SessionName}");
+        }
+
+        RefreshConnectionTabs();
+    }
+
+    private List<ConnectionBookmark> BuildPaneBookmarks(FilePaneControl pane)
+    {
+        var list = new List<ConnectionBookmark>();
+
+        if (!_paneOpenedSessions.TryGetValue(pane, out var opened))
+            opened = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        string? paneSession = SshSessionOf(pane.CurrentPath);
+
+        opened.RemoveWhere(name =>
+            !Providers.SshFileSystemProvider.IsSessionOpen(name) &&
+            !string.Equals(paneSession, name, StringComparison.OrdinalIgnoreCase));
+
+        foreach (string name in opened.OrderBy(n => n, StringComparer.OrdinalIgnoreCase))
+        {
+            bool onThisPane = string.Equals(paneSession, name, StringComparison.OrdinalIgnoreCase);
+            if (!Providers.SshFileSystemProvider.IsSessionOpen(name) && !onThisPane)
+                continue;
+
+            string target = $"ssh://{name}/";
+            if (_driveHistory.TryGetValue($"ssh://{name}", out string? saved) &&
+                !string.IsNullOrWhiteSpace(saved))
+            {
+                target = saved;
+            }
+
+            list.Add(new ConnectionBookmark
+            {
+                Title = name,
+                SessionName = name,
+                TargetPath = target,
+                IsActive = onThisPane && !pane.IsTerminalVisible && !pane.PendingTerminalActivation,
+                IsTerminal = false
+            });
+        }
+
+        if (_paneOpenedTerminals.TryGetValue(pane, out var terminals) && terminals.Count > 0)
+        {
+            foreach (string sshName in terminals)
+            {
+                string target = $"ssh://{sshName}/";
+                if (_driveHistory.TryGetValue($"ssh://{sshName}", out string? saved) &&
+                    !string.IsNullOrWhiteSpace(saved))
+                {
+                    target = saved;
+                }
+
+                list.Add(new ConnectionBookmark
+                {
+                    Title = sshName,
+                    SessionName = sshName,
+                    TargetPath = target,
+                    IsActive = (pane.IsTerminalVisible || pane.PendingTerminalActivation) &&
+                        string.Equals(paneSession, sshName, StringComparison.OrdinalIgnoreCase),
+                    IsTerminal = true
+                });
+            }
+        }
+
+        return list;
     }
 }

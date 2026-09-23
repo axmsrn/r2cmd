@@ -76,6 +76,7 @@ public sealed class KeyboardWindow : Window
 • Space — Toggle selection and calculate folder size
 • Ctrl + A or * (Shift + 8) — Select all / Deselect all
 • Ctrl + Click — Toggle the mark on a single row
+• Shift + Click — Mark a range from the cursor to the clicked file
 
 📋 CLIPBOARD
 • Ctrl + Shift + C — Copy full paths of selected files
@@ -83,20 +84,19 @@ public sealed class KeyboardWindow : Window
 • Right click a breadcrumb — Copy that part of the path";
 
         string col2Text =
-@"💻 INTEGRATED TERMINAL
-• Ctrl + ~ — Terminal fills the active panel
-• Ctrl + T — Terminal beside the file list (split mode)
-• Tab — Split mode: switches panels / Full: focus terminal
+        @"💻 INTEGRATED TERMINAL
+• Ctrl + ~ — Toggle the global bottom terminal
 • Ctrl + Tab — Focus the terminal / back to the file list
-• Ctrl + I — Shell completion (Tab is used for focus)
 • Up / Down — The shell's own command history
 • Shift + PageUp / PageDown — Scroll terminal output
 • Ctrl + C / Ctrl + V — Copy selected text / Paste
 • Shift + Insert — Paste text from clipboard
+• Ctrl + Shift + K — Clear terminal screen and scrollback buffer
 • Ctrl + D — Send EOF / Close SSH session
 • Ctrl + Q — Force close terminal session
 • Esc — Clear terminal selection or line buffer
-• Drag the divider to resize the terminal
+• Drag the horizontal divider to resize the terminal
+
 
 🔍 SEARCH, FAVORITES, AND FILTERS
 • Type any letter — Quick search filter in current folder
@@ -104,6 +104,8 @@ public sealed class KeyboardWindow : Window
 • Alt + F7 — Open advanced file search window
 • Ctrl + D — Open Favorites menu (and add current folder)
 • Alt + D — Open Favorites manager
+• Enter in the manager — Go to the selected folder
+• Drag a row in the manager — Reorder
 
 🖱️ MOUSE
 • Right click on a file — Windows context menu

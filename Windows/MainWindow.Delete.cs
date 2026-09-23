@@ -59,559 +59,6 @@ public partial class MainWindow
         (attributes & FileAttributes.ReparsePoint) != 0;
 
     // =========================================================================
-    // FOLDER SIZES — background work, never a modal wait
-    //
-    // Counting a node_modules tree over SSH takes minutes. It used to run under
-    // SetBusy, which put the wait cursor on the whole desktop and made _busy
-    // swallow every hotkey, so the only option was to sit and watch.
-    //
-    // Now it runs detached: no busy flag, no cursor, progress in its own status
-    // field. Results are not cached across navigation — like Total Commander,
-    // leaving the folder means the number is counted again next time, which is
-    // far simpler than keeping a cache honest as the tree changes underneath it.
-    //
-    // The only thing remembered is which scans are in flight, so a second Space
-    // on the same folder — or the same folder open in both panes — does not walk
-    // the tree twice at once. Touched from the UI thread only.
-    // =========================================================================
-    private readonly HashSet<string> _sizeScansRunning = new(StringComparer.OrdinalIgnoreCase);
-    private int _sizeJobsRunning;
-
-    private void QueueFolderSize(FileEntry entry)
-    {
-        if (!entry.IsFolder || entry.Name == "..") return;
-
-        string path = entry.FullPath;
-
-        if (!_sizeScansRunning.Add(path))
-        {
-            entry.SizeCalculating = true;
-            return;
-        }
-
-        _ = RunFolderSizeAsync(entry, path);
-    }
-
-    private async Task RunFolderSizeAsync(FileEntry entry, string path)
-    {
-        entry.SizeCalculating = true;
-        _sizeJobsRunning++;
-        UpdateBackgroundStatus();
-
-        try
-        {
-            long size = await Task.Run(() => CalculateFolderSize(path));
-
-            if (size >= 0)
-            {
-                entry.Size = size;
-                entry.SizeKnown = true;
-            }
-            else entry.SizeKnown = false;
-        }
-        catch { entry.SizeKnown = false; }
-        finally
-        {
-            entry.SizeCalculating = false;
-            _sizeScansRunning.Remove(path);
-
-            _sizeJobsRunning--;
-            UpdateBackgroundStatus();
-        }
-    }
-
-    private void QueueAllFolderSizes(FilePaneControl pane)
-    {
-        var targets = pane.Items
-            .Where(e => e.IsFolder && e.Name != ".." && !e.SizeKnown && !e.SizeCalculating)
-            .ToList();
-
-        if (targets.Count == 0) return;
-
-        _ = RunAllFolderSizesAsync(targets);
-    }
-
-    private async Task RunAllFolderSizesAsync(List<FileEntry> targets)
-    {
-        int done = 0;
-
-        foreach (var entry in targets)
-        {
-            string path = entry.FullPath;
-            done++;
-
-            if (!_sizeScansRunning.Add(path)) continue;
-
-            entry.SizeCalculating = true;
-            SetBackgroundStatus($"Folder sizes: {done} / {targets.Count}");
-
-            try
-            {
-                long size = await Task.Run(() => CalculateFolderSize(path));
-
-                if (size >= 0)
-                {
-                    entry.Size = size;
-                    entry.SizeKnown = true;
-                }
-                else entry.SizeKnown = false;
-            }
-            catch { entry.SizeKnown = false; }
-            finally
-            {
-                entry.SizeCalculating = false;
-                _sizeScansRunning.Remove(path);
-            }
-        }
-
-        UpdateBackgroundStatus();
-    }
-
-    private void UpdateBackgroundStatus()
-    {
-        SetBackgroundStatus(_sizeJobsRunning switch
-        {
-            <= 0 => null,
-            1 => "Calculating folder size...",
-            _ => $"Calculating {_sizeJobsRunning} folder sizes..."
-        });
-    }
-
-    private static long CalculateFolderSize(string path)
-    {
-        try
-        {
-            if (path.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
-            {
-                var result = Providers.SshFileSystemProvider.RemoteSumTree(path);
-                return result.Bytes;
-            }
-
-            long total = 0;
-            var sizes = new FileSystemEnumerable<long>(
-                path,
-                (ref FileSystemEntry entry) => entry.IsDirectory ? 0 : entry.Length,
-                s_recursiveEnumOptions)
-            {
-                // A junction belongs to its target, not to this folder
-                ShouldRecursePredicate = (ref FileSystemEntry e) => !IsReparse(e.Attributes)
-            };
-
-            foreach (var size in sizes) total += size;
-            return total;
-        }
-        catch { return -1; }
-    }
-
-    // =========================================================================
-    // Blocks two distinct mistakes:
-    //   1. dropping a folder into itself or into one of its own subfolders;
-    //   2. copying an entry into the directory it already lives in, where the
-    //      source and the destination path are literally the same file.
-    // =========================================================================
-    private FileEntry? FindSelfOperationConflict(List<FileEntry> items, string destPath)
-    {
-        return items.FirstOrDefault(i => IsSelfOperationConflict(i, destPath));
-    }
-
-    // Blocks two mistakes for both local and ssh:// paths:
-    // 1) copying/moving an item into the directory it already lives in;
-    // 2) dropping a folder into itself or into one of its own subfolders.
-    private static bool IsSelfOperationConflict(FileEntry item, string destPath)
-    {
-        if (item.FullPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase) ||
-            destPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
-        {
-            // Mixed local/SSH is never "same location"
-            if (!item.FullPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase) ||
-                !destPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            string src = item.FullPath.TrimEnd('/');
-            string dest = destPath.TrimEnd('/');
-
-            // Different SSH sessions cannot be the same tree
-            string srcSession = SshSessionName(src);
-            string destSession = SshSessionName(dest);
-            if (!string.Equals(srcSession, destSession, StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            // Parent of source == destination → copy into its own folder
-            int lastSlash = src.LastIndexOf('/');
-            if (lastSlash > "ssh://".Length)
-            {
-                string parent = src.Substring(0, lastSlash);
-                if (string.Equals(parent, dest, StringComparison.OrdinalIgnoreCase))
-                    return true;
-            }
-
-            // Folder into itself or into a child: dest is src or starts with src/
-            if (!item.IsFolder) return false;
-
-            return string.Equals(dest, src, StringComparison.OrdinalIgnoreCase) ||
-                   dest.StartsWith(src + "/", StringComparison.OrdinalIgnoreCase);
-        }
-
-        // ----- Local paths -----
-        string localDest = destPath.TrimEnd('\\');
-        string localSrc = item.FullPath.TrimEnd('\\');
-
-        string? parentLocal = Path.GetDirectoryName(localSrc);
-        if (parentLocal != null &&
-            string.Equals(parentLocal.TrimEnd('\\'), localDest, StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        if (!item.IsFolder) return false;
-
-        string srcPrefix = localSrc.EndsWith("\\") ? localSrc : localSrc + "\\";
-        return (localDest + "\\").StartsWith(srcPrefix, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string SshSessionName(string sshPath)
-    {
-        // ssh://SessionName/rest...
-        string rest = sshPath.Length > 6 ? sshPath.Substring(6) : "";
-        int slash = rest.IndexOf('/');
-        return slash < 0 ? rest : rest.Substring(0, slash);
-    }
-
-    // =========================================================================
-    // OPENING A FILE WITH THE SHELL
-    //
-    // ShellExecute is only correct for a real path on disk. An SSH entry carries
-    // "ssh://session/dir/server.js", and Windows reads that as a URL: it looks up
-    // the registered handler for the ssh: scheme — PuTTY, OpenSSH, Windows
-    // Terminal, whatever is installed — and launches a console session. That is
-    // why clicking a remote file opened a terminal instead of the file.
-    //
-    // A path inside an archive fails differently: it looks local but nothing
-    // exists there.
-    //
-    // Both cases are materialised into TEMP first and the local copy is opened.
-    // Edits to that copy are NOT sent back to the server or the archive.
-    // =========================================================================
-    private async Task OpenFileExternallyAsync(FileEntry entry)
-    {
-        if (File.Exists(entry.FullPath))
-        {
-            ShellOpen(entry.FullPath);
-            return;
-        }
-
-        string? localCopy = await MaterializeToTempAsync(entry);
-        if (localCopy == null) return;
-
-        ShellOpen(localCopy);
-        SetStatus($"Opened a temporary copy of {entry.Name}. Changes are not sent back.");
-    }
-
-    private void ShellOpen(string localPath)
-    {
-        try
-        {
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = localPath,
-                UseShellExecute = true
-            });
-        }
-        catch (Exception ex)
-        {
-            MessageDialog.Show(this, $"Failed to launch file.\n\n{ex.Message}", "Execution Error");
-        }
-    }
-
-    private async Task<string?> MaterializeToTempAsync(FileEntry entry)
-    {
-        const long LargeFileThreshold = 64L * 1024 * 1024;
-
-        if (entry.Size > LargeFileThreshold)
-        {
-            var confirm = new ConfirmDialog(
-                $"{entry.Name} is {Helpers.FormatSize(entry.Size)}.\nDownload a temporary copy to open it?",
-                "Open file")
-            { Owner = this };
-
-            if (confirm.ShowDialog() != true) return null;
-        }
-
-        string folder = Path.Combine(Path.GetTempPath(), "R2Cmd", TempFolderFor(entry.FullPath));
-        string localPath = Path.Combine(folder, SafeFileName(entry.Name));
-
-        SetBackgroundStatus($"Downloading {entry.Name}...");
-
-        try
-        {
-            Directory.CreateDirectory(folder);
-
-            var (archivePath, internalPath) = ArchiveService.ParseVirtualPath(entry.FullPath);
-
-            if (archivePath != null && !string.IsNullOrEmpty(internalPath) && File.Exists(archivePath))
-            {
-                await Task.Run(() => ArchiveService.ExtractFile(archivePath, internalPath, localPath));
-            }
-            else
-            {
-                var provider = Providers.FileSystemFactory.GetProvider(entry.FullPath);
-
-                await using var source = await provider.OpenReadAsync(entry.FullPath);
-                await using var target = new FileStream(localPath, FileMode.Create, FileAccess.Write,
-                    FileShare.None, 81920, useAsync: true);
-
-                await source.CopyToAsync(target);
-            }
-
-            return localPath;
-        }
-        catch (Exception ex)
-        {
-            MessageDialog.Show(this, $"Cannot open {entry.Name}:\n{ex.Message}", "Open");
-            return null;
-        }
-        finally
-        {
-            // Restores whatever the folder size scan is reporting, if anything
-            UpdateBackgroundStatus();
-        }
-    }
-
-    private static string SafeFileName(string name)
-    {
-        foreach (char c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
-        return string.IsNullOrWhiteSpace(name) ? "file" : name;
-    }
-
-    // One folder per source path, so two server.js from different hosts do not
-    // overwrite each other. FNV-1a rather than String.GetHashCode, which is
-    // randomised per process — the same remote file would otherwise land in a
-    // different temp folder on every run of the application.
-    //
-    // Case folding happens per character: ToLowerInvariant() on the whole path
-    // allocated a throwaway string for nothing.
-    private static string TempFolderFor(string fullPath)
-    {
-        unchecked
-        {
-            uint hash = 2166136261;
-            foreach (char c in fullPath)
-            {
-                hash ^= char.ToLowerInvariant(c);
-                hash *= 16777619;
-            }
-            return hash.ToString("x8");
-        }
-    }
-
-    private async Task RefreshTargetAsync(FilePaneControl targetPane)
-    {
-        await targetPane.RefreshAsync();
-        await SyncPanesIfSamePath(targetPane);
-    }
-
-    // =========================================================================
-    // SHARED PROGRESS WINDOW HOST
-    // Runs a copy/move/pack dialog and mirrors its progress line (including the
-    // elapsed timer) into the bottom status bar, exactly like delete does.
-    //
-    // The summary line is written LAST, after pane refresh and focus callbacks
-    // have drained, and the status lock is released only after that. Otherwise
-    // the panes would immediately overwrite the result with their own messages
-    // and the statistics would vanish the moment the window closes.
-    // =========================================================================
-    private async Task RunFileOperationAsync(ProgressWindow dialog, Func<Task>? onSuccess = null, FilePaneControl? sourcePane = null)
-    {
-        this.IsEnabled = false;
-
-        // Lock the status bar so pane messages cannot overwrite operation progress
-        IsStatusLocked = true;
-
-        EventHandler<string> onStatus = (s, text) => SetStatus(text, forceUpdate: true);
-        dialog.StatusUpdated += onStatus;
-
-        var tcs = new TaskCompletionSource<bool>();
-        dialog.Closed += (s, e) => tcs.TrySetResult(true);
-        dialog.BackgroundRequested += (s, e) => { this.IsEnabled = true; };
-
-        try
-        {
-            dialog.Show();
-            await tcs.Task;
-        }
-        finally
-        {
-            dialog.StatusUpdated -= onStatus;
-            if (!this.IsEnabled) this.IsEnabled = true;
-        }
-
-        // =========================================================================
-        // Everything below runs under the status lock, so the panes cannot clobber
-        // the summary. The try/finally matters: without it an exception from
-        // onSuccess() (a disconnected network drive is enough) would leave
-        // IsStatusLocked stuck at true and the status bar dead until restart.
-        // =========================================================================
-        string finalStatus = dialog.GetFinalStatus();
-
-        try
-        {
-            if (!dialog.IsCancelled && dialog.SuccessfullyProcessedFiles > 0 && onSuccess != null)
-            {
-                await onSuccess();
-            }
-
-            sourcePane?.ClearSelection();
-        }
-        finally
-        {
-            // ApplicationIdle runs after the panes' own Background/Input priority
-            // callbacks, so this is the last thing written to the status bar
-            _ = Dispatcher.BeginInvoke(new Action(() =>
-            {
-                sourcePane?.FocusPanel();
-                SetStatus(finalStatus, forceUpdate: true);
-
-                // Release only now: the line stays until the user does something else
-                IsStatusLocked = false;
-            }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
-        }
-    }
-
-    // =========================================================================
-    // Single entry point for Copy / Move / drag-and-drop.
-    // explicitDestPath allows drag-and-drop to target a specific subfolder.
-    // =========================================================================
-    private async Task StartTransferAsync(
-        List<FileEntry> items,
-        FilePaneControl? sourcePane,
-        FilePaneControl targetPane,
-        FileOperation operation,
-        string? explicitDestPath = null)
-    {
-        if (items.Count == 0) return;
-
-        // Use the explicitly provided path (from a subfolder drop), or fallback to the pane's root
-        string destPath = explicitDestPath ?? targetPane.CurrentPath;
-        bool isMove = operation == FileOperation.Move;
-
-        var conflict = FindSelfOperationConflict(items, destPath);
-        if (conflict != null)
-        {
-            MessageDialog.Show(this,
-                $"Cannot {(isMove ? "move" : "copy")} '{conflict.Name}': the destination is the item's own location or a subfolder of it.\n\n" +
-                $"Source: {conflict.FullPath}\nDestination: {destPath}",
-                isMove ? "Move Error" : "Copy Error");
-            return;
-        }
-
-        var dialog = new ProgressWindow(items, destPath, operation) { Owner = this };
-
-        // Move touches both panes, copy only the target one
-        Func<Task> onSuccess = isMove
-            ? () => DoRefreshAsync()
-            : () => RefreshTargetAsync(targetPane);
-
-        await RunFileOperationAsync(dialog, onSuccess, sourcePane);
-    }
-
-    private Task DoCopyAsync() =>
-        StartTransferAsync(_activePane.SelectedItems, _activePane, _inactivePane, FileOperation.Copy);
-
-    private Task DoMoveAsync() =>
-        StartTransferAsync(_activePane.SelectedItems, _activePane, _inactivePane, FileOperation.Move);
-
-    private Task HandleFilesDroppedAsync(FilePaneControl targetPane, Controls.FilePaneControl.FilesDroppedEventArgs args) =>
-        StartTransferAsync(args.Items, null, targetPane, args.IsMove ? FileOperation.Move : FileOperation.Copy, args.TargetPath);
-
-    private async Task DoPackAsync()
-    {
-        var sourcePane = _activePane;
-        var targetPane = _inactivePane;
-
-        var itemsToPack = sourcePane.SelectedItems;
-        if (itemsToPack.Count == 0) return;
-
-        string currentDirPath = sourcePane.CurrentPath;
-        string destDirPath = targetPane.CurrentPath;
-
-        string defaultName = Path.GetFileName(currentDirPath.TrimEnd('\\'));
-        if (string.IsNullOrEmpty(defaultName) || defaultName == "Network") defaultName = "archive";
-        defaultName += ".zip";
-
-        string? zipName = ShowInputBox("Pack files", $"Pack {itemsToPack.Count} item(s) to:", defaultName);
-        if (string.IsNullOrWhiteSpace(zipName)) return;
-
-        if (!zipName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)) zipName += ".zip";
-        string targetZipPath = Path.Combine(destDirPath, zipName);
-
-        if (File.Exists(targetZipPath))
-        {
-            MessageDialog.Show(this, "Archive already exists!", "Pack Error");
-            return;
-        }
-
-        var dialog = new ProgressWindow(itemsToPack, targetZipPath, FileOperation.Pack) { Owner = this };
-
-        await RunFileOperationAsync(dialog, () => RefreshTargetAsync(targetPane), sourcePane);
-    }
-
-    private string? ShowInputBox(string title, string prompt, string defaultText)
-    {
-        var window = new Window
-        {
-            Title = title,
-            Width = 400,
-            SizeToContent = SizeToContent.Height,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            Owner = this,
-            ResizeMode = ResizeMode.NoResize,
-            Background = this.Background,
-            Foreground = this.Foreground
-        };
-
-        // Laid out by the panel instead of by hand-tuned margins like
-        // "Thickness(0, 0, 105, 15)", which broke as soon as a button changed width.
-        var root = new StackPanel { Margin = new Thickness(15) };
-
-        var lbl = new TextBlock { Text = prompt, Margin = new Thickness(0, 0, 0, 8) };
-
-        var txt = new TextBox
-        {
-            Text = defaultText,
-            Height = 25,
-            Padding = new Thickness(3),
-            Margin = new Thickness(0, 0, 0, 15),
-            Background = this.Background,
-            Foreground = this.Foreground,
-            CaretBrush = this.Foreground
-        };
-
-        var buttons = new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            HorizontalAlignment = HorizontalAlignment.Right
-        };
-
-        var btnOk = new Button { Content = "OK", Width = 80, Height = 30, IsDefault = true, Margin = new Thickness(0, 0, 10, 0) };
-        var btnCancel = new Button { Content = "Cancel", Width = 80, Height = 30, IsCancel = true };
-
-        btnOk.Click += (s, e) => window.DialogResult = true;
-
-        buttons.Children.Add(btnOk);
-        buttons.Children.Add(btnCancel);
-
-        root.Children.Add(lbl);
-        root.Children.Add(txt);
-        root.Children.Add(buttons);
-
-        window.Content = root;
-        window.SourceInitialized += (s, e) => Helpers.SetTitleBarTheme(window, ThemeManager.IsDarkTheme);
-        window.Loaded += (s, e) => { txt.Focus(); txt.CaretIndex = txt.Text.Length; };
-
-        return window.ShowDialog() == true ? txt.Text : null;
-    }
-
-    // =========================================================================
     // Counts how many real files a selected entry represents, so the status bar
     // can report "1234 / 7348 files" instead of "1 item" for a whole folder.
     // Reparse points are never walked; an empty folder still counts as one unit.
@@ -728,15 +175,15 @@ public partial class MainWindow
     // the rest — or Cancel the whole operation. Whatever is left behind is listed
     // by full path at the end.
     // =========================================================================
-    private async Task DoDeleteAsync(bool permanent)
+    private async Task DoDeleteAsync(bool permanent, bool skipConfirm = false, List<FileEntry>? itemsOverride = null)
     {
         var sourcePane = _activePane;
-        var items = sourcePane.SelectedItems.ToList();
+        var items = itemsOverride ?? sourcePane.SelectedItems.ToList();
         if (items.Count == 0) return;
 
         bool anySsh = items.Any(i => i.FullPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase));
 
-        if (!ConfirmDelete(items.Select(i => i.Name), permanent, anySsh)) return;
+        if (!skipConfirm && !ConfirmDelete(items.Select(i => i.Name), permanent, anySsh)) return;
 
         string startingPath = sourcePane.CurrentPath;
 
@@ -754,6 +201,11 @@ public partial class MainWindow
         int totalFiles = 0;    // result of the recursive pre-scan
         bool skipAllFailures = false;
         var errors = new List<string>();
+
+        // The list keeps at most MaxCollectedErrors paths for the dialog; the
+        // real number of failures is counted separately. The summary used to
+        // report errors.Count, so 5000 failures showed up as "Failed: 200".
+        int failedCount = 0;
         var fileCounts = new Dictionary<FileEntry, int>();
         string? itemToRestore = null;
 
@@ -861,6 +313,7 @@ public partial class MainWindow
 
             lock (errors)
             {
+                failedCount++;
                 if (errors.Count < MaxCollectedErrors) errors.Add($"{path}: {reason}");
             }
 
@@ -917,64 +370,48 @@ public partial class MainWindow
             // ---------------------------------------------------------------------
             // PASS 2: delete
             // ---------------------------------------------------------------------
-            await Task.Run(async () =>
+
+            // Thread-safe unbounded channel for passing deleted entries to the UI thread
+            var uiChannel = System.Threading.Channels.Channel.CreateUnbounded<FileEntry>(
+                new System.Threading.Channels.UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+
+            // UI DispatcherTimer handles batch updates without flooding the Dispatcher queue
+            var uiTimer = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Background)
             {
-                // Every chunk is one shell call and one Recycle Bin entry, so a
-                // larger chunk means fewer round trips. Progress is time-throttled
-                // anyway, so responsiveness does not depend on this number.
-                const int ChunkSize = 25;
+                Interval = TimeSpan.FromMilliseconds(66)
+            };
 
-                bool canceled = false;
-
-                var uiUpdateStopwatch = System.Diagnostics.Stopwatch.StartNew();
-                var uisToRemove = new List<FileEntry>();
-
-                // Throttled status refresh, also callable from inside recursive deletion
-                void ReportProgress(bool force)
+            uiTimer.Tick += (s, e) =>
+            {
+                while (uiChannel.Reader.TryRead(out var rm))
                 {
-                    if (cts.IsCancellationRequested) return;
-                    if (!force && uiUpdateStopwatch.ElapsedMilliseconds < 66) return;
-                    uiUpdateStopwatch.Restart();
+                    if (sourcePane.CurrentPath == startingPath) sourcePane.Items.Remove(rm);
+                }
 
-                    List<FileEntry> batchToRemove;
-                    lock (uisToRemove)
-                    {
-                        batchToRemove = uisToRemove.ToList();
-                        uisToRemove.Clear();
-                    }
-
+                if (!Volatile.Read(ref finished) && !cts.IsCancellationRequested)
+                {
                     int currentFiles = Volatile.Read(ref deletedFiles);
                     string timeElapsed = $"{totalTimeStopwatch.Elapsed.TotalSeconds:0.000}s";
+                    bool isForeground = sourcePane.CurrentPath == startingPath && _activePane == sourcePane;
+                    string escHint = isForeground ? " [ESC to cancel]" : " (Background)";
 
-                    _ = Dispatcher.InvokeAsync(() =>
-                    {
-                        if (sourcePane.CurrentPath == startingPath)
-                        {
-                            // The entries in the batch are the very objects the pane
-                            // holds, so removal is a reference lookup. Searching by
-                            // full path made this O(n2) on a large selection.
-                            foreach (var rm in batchToRemove) sourcePane.Items.Remove(rm);
-                        }
-
-                        // Checked here, on the UI thread: an update queued a moment before
-                        // the last file was removed must not repaint "[ESC to cancel]"
-                        // over the final summary.
-                        if (!Volatile.Read(ref finished) && !cts.IsCancellationRequested)
-                        {
-                            bool isForeground = sourcePane.CurrentPath == startingPath && _activePane == sourcePane;
-                            string escHint = isForeground ? " [ESC to cancel]" : " (Background)";
-
-                            SetStatus(permanent
-                                ? $"Deleting... ({currentFiles} / {totalFiles} files) — Time: {timeElapsed}{escHint}"
-                                : $"Moving to Recycle Bin... ({currentFiles} / {totalFiles} files) — Time: {timeElapsed}{escHint}", forceUpdate: true);
-                        }
-                    }, System.Windows.Threading.DispatcherPriority.Background);
+                    SetStatus(permanent
+                        ? $"Deleting... ({currentFiles} / {totalFiles} files) — Time: {timeElapsed}{escHint}"
+                        : $"Moving to Recycle Bin... ({currentFiles} / {totalFiles} files) — Time: {timeElapsed}{escHint}", forceUpdate: true);
                 }
+            };
+
+            uiTimer.Start();
+
+            await Task.Run(async () =>
+            {
+                const int ChunkSize = 25;
+                bool canceled = false;
 
                 void MarkRemoved(FileEntry entry)
                 {
                     Interlocked.Increment(ref okItems);
-                    lock (uisToRemove) { uisToRemove.Add(entry); }
+                    uiChannel.Writer.TryWrite(entry);
                 }
 
                 void CountFilesOf(FileEntry entry)
@@ -1031,10 +468,8 @@ public partial class MainWindow
                         {
                             try
                             {
-                                // Per-file decisions are taken inside, so the unlocked
-                                // files around a locked one are still removed
                                 Win32FastDeleteDirectory(item.FullPath,
-                                    () => { Interlocked.Increment(ref deletedFiles); ReportProgress(false); },
+                                    () => Interlocked.Increment(ref deletedFiles),
                                     OnFailure, cts.Token);
                             }
                             catch (OperationCanceledException) { canceled = true; }
@@ -1053,8 +488,6 @@ public partial class MainWindow
                                 }
                                 catch (Exception ex)
                                 {
-                                    // Read-only or hidden alone is enough to be refused,
-                                    // and that is worth clearing without asking
                                     ClearBlockingAttributes(item.FullPath, isDirectory: false);
 
                                     try
@@ -1086,9 +519,6 @@ public partial class MainWindow
                         {
                             try
                             {
-                                // One shell call for the whole chunk. The shell returns a
-                                // single verdict for it, so a failure says nothing about
-                                // which item is to blame — that is what the retry is for.
                                 if (batch.Count > 1 &&
                                     RecycleHelper.SendToRecycleBin(batch.Select(x => x.FullPath), silent: true))
                                 {
@@ -1104,9 +534,6 @@ public partial class MainWindow
                                 {
                                     if (cts.Token.IsCancellationRequested) { canceled = true; return; }
 
-                                    // The batch may have moved this one before failing on a
-                                    // later file; asking about it now would be a phantom
-                                    // failure
                                     if (!File.Exists(item.FullPath) && !Directory.Exists(item.FullPath))
                                     {
                                         CountFilesOf(item);
@@ -1127,11 +554,8 @@ public partial class MainWindow
 
                                         if (item.IsFolder)
                                         {
-                                            // Rejected as a whole. Go inside and take
-                                            // everything that is not held; the questions
-                                            // are asked there, about real files.
                                             RecycleTreeContents(item.FullPath, OnFailure,
-                                                () => { Interlocked.Increment(ref deletedFiles); ReportProgress(false); },
+                                                () => Interlocked.Increment(ref deletedFiles),
                                                 cts.Token);
 
                                             if (!Directory.Exists(item.FullPath)) MarkRemoved(item);
@@ -1154,17 +578,18 @@ public partial class MainWindow
                             catch (OperationCanceledException) { canceled = true; }
                         });
                     }
-
-                    ReportProgress(force: false);
                 }
 
                 Volatile.Write(ref finished, true);
-
-                // Final pass: only drop the remaining rows from the pane. No status
-                // text here, otherwise a queued "[ESC to cancel]" line would land
-                // after the summary and claim the operation is still running.
-                ReportProgress(force: true);
             });
+
+            uiTimer.Stop();
+
+            // Final drain to ensure no items are left in the channel after the task finishes
+            while (uiChannel.Reader.TryRead(out var rm))
+            {
+                if (sourcePane.CurrentPath == startingPath) sourcePane.Items.Remove(rm);
+            }
         }
         finally
         {
@@ -1196,7 +621,7 @@ public partial class MainWindow
         }
         else
         {
-            ShowSummary(permanent ? "Delete" : "Recycle", deletedFiles, okItems, errors, finalTimeElapsed);
+            ShowSummary(permanent ? "Delete" : "Recycle", deletedFiles, okItems, errors, failedCount, finalTimeElapsed);
         }
     }
 
@@ -1402,29 +827,29 @@ public partial class MainWindow
     // reports "access denied" on the top folder, this reports the full path of
     // every file that is actually holding it.
     // =========================================================================
-    private void ShowSummary(string action, int files, int items, List<string> errors, string timeElapsed)
+    private void ShowSummary(string action, int files, int items, List<string> errors, int failed, string timeElapsed)
     {
         string done = $"{action}: {files} file(s) in {items} item(s) done";
 
-        if (errors.Count == 0)
+        if (failed == 0)
         {
             SetStatus($"{done}. \u2014 Time: {timeElapsed}");
             return;
         }
 
-        SetStatus($"{done}, {errors.Count} failed. \u2014 Time: {timeElapsed}");
+        SetStatus($"{done}, {failed} failed. \u2014 Time: {timeElapsed}");
 
         const int maxShown = 10;
 
         string list = string.Join(Environment.NewLine, errors.Take(maxShown).Select(e => $"  - {e}"));
 
-        if (errors.Count > maxShown)
-            list += $"{Environment.NewLine}{Environment.NewLine}  ...and {errors.Count - maxShown} more.";
+        if (failed > maxShown)
+            list += $"{Environment.NewLine}{Environment.NewLine}  ...and {failed - maxShown} more.";
 
         string message =
             $"{action} completed, but some items were left behind.{Environment.NewLine}{Environment.NewLine}" +
             $"Succeeded: {files}{Environment.NewLine}" +
-            $"Failed: {errors.Count}{Environment.NewLine}{Environment.NewLine}" +
+            $"Failed: {failed}{Environment.NewLine}{Environment.NewLine}" +
             $"Still on disk:{Environment.NewLine}{list}";
 
         MessageDialog.Show(this, message, $"{action} finished with errors");

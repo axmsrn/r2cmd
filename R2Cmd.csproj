@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
@@ -10,14 +10,25 @@
     <RootNamespace>R2Cmd</RootNamespace>
     <ApplicationIcon>Assets\appicon.ico</ApplicationIcon>
 
+    <!-- Enable unsafe code required by [LibraryImport] source generators -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- Strip debug symbols from the output binary -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+
     <!-- Removes ~28 MB of ICU data. PredefinedCulturesOnly=false lets WPF still
          create named cultures (they just behave invariantly), avoiding the crash -->
     <InvariantGlobalization>true</InvariantGlobalization>
     <PredefinedCulturesOnly>false</PredefinedCulturesOnly>
 
-    <!-- No .pdb symbols in Release output -->
-    <DebugType>none</DebugType>
-    <DebugSymbols>false</DebugSymbols>
+    <!-- Size optimizations for .NET 10 single-file deployment -->
+    <IlcGenerateStackTraceData>false</IlcGenerateStackTraceData>
+    <OptimizationPreference>Size</OptimizationPreference>
+    <EventSourceSupport>false</EventSourceSupport>
+    <MetricsSupport>false</MetricsSupport>
+    <EnableUnsafeBinaryFormatterSerialization>false</EnableUnsafeBinaryFormatterSerialization>
+    <HttpActivityPropagationSupport>false</HttpActivityPropagationSupport>
   </PropertyGroup>
 
   <ItemGroup>

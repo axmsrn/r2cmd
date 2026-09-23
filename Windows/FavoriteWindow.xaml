@@ -16,15 +16,24 @@
         <ListBox x:Name="lstFavorites" Grid.Column="0"
             Grid.IsSharedSizeScope="True"
             HorizontalContentAlignment="Stretch"
+            FocusVisualStyle="{x:Null}"
             Background="{DynamicResource Brush.Surface}"
             BorderBrush="{DynamicResource Brush.Border}"
             Foreground="{DynamicResource Brush.TextPrimary}"
-            MouseDoubleClick="OnFavoriteDoubleClick">
+            AllowDrop="True"
+            VirtualizingStackPanel.IsVirtualizing="False"
+            MouseDoubleClick="OnFavoriteDoubleClick"
+            PreviewMouseLeftButtonDown="LstFavorites_PreviewMouseLeftButtonDown"
+            PreviewMouseMove="LstFavorites_PreviewMouseMove"
+            DragOver="LstFavorites_DragOver"
+            DragLeave="LstFavorites_DragLeave"
+            Drop="LstFavorites_Drop">
 
             <ListBox.ItemContainerStyle>
                 <Style TargetType="ListBoxItem">
                     <Setter Property="Padding" Value="4,4" />
                     <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                    <Setter Property="FocusVisualStyle" Value="{x:Null}" />
                     <Setter Property="Template">
                         <Setter.Value>
                             <ControlTemplate TargetType="ListBoxItem">
@@ -34,7 +43,7 @@
                                     SnapsToDevicePixels="true">
                                     <ContentPresenter
                                         HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
-                                        VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
+                                        VerticalAlignment="{TemplateBinding VerticalAlignment}" />
                                 </Border>
                                 <ControlTemplate.Triggers>
                                     <Trigger Property="IsMouseOver" Value="True">

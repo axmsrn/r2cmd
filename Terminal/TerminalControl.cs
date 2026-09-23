@@ -20,7 +20,8 @@ public sealed class TerminalControl : Control, IDisposable
     private const double PadTop = 2;
 
     private readonly VtScreen _screen;
-    private readonly ConcurrentQueue<char[]> _pending = new();
+    // Using a tuple to store the rented buffer and the actual length of the payload
+    private readonly ConcurrentQueue<(char[] Buffer, int Length)> _pending = new();
     private readonly DispatcherTimer _timer;
 
     private ITerminalSession? _session;
@@ -40,14 +41,15 @@ public sealed class TerminalControl : Control, IDisposable
     // Reusable buffer for character processing (safe to mutate, not retained by WPF)
     private char[] _charBuffer = Array.Empty<char>();
 
-    // Cache for advance widths. GlyphRun retains references, but since monospaced widths
-    // never change, we can safely share these arrays across all GlyphRuns.
-    private double[][] _advanceWidthCache = Array.Empty<double[]>();
+    // Caches for read-only typography structures. GlyphRun retains these, but since they
+    // contain identical data for any text run of length N, we can share them safely.
+    private double[][] _zeroAdvancesCache = Array.Empty<double[]>();
+    private Point[][] _glyphOffsetsCache = Array.Empty<Point[]>();
+    private double _cachedCellWidth = -1;
 
     // --- SLEEP & TIMEOUT CLOCKS ---
     private DateTime _lastTickTime = DateTime.UtcNow;
     private DateTime _lastActivityTime = DateTime.UtcNow;
-
     // --- RESIZE DEBOUNCING ---
     private DateTime _lastResizeTime = DateTime.UtcNow;
     private (int cols, int rows)? _pendingResize;
@@ -102,8 +104,6 @@ public sealed class TerminalControl : Control, IDisposable
     private readonly Color[] _palette = new Color[16];
 
     private readonly Dictionary<Color, SolidColorBrush> _brushCache = new();
-    private long _lastThemeCheck = -1;
-    private const int ThemeCheckIntervalMs = 500;
 
     private Brush _backgroundBrush = Brushes.Black;
     private Brush _foregroundBrush = Brushes.White;
@@ -121,13 +121,40 @@ public sealed class TerminalControl : Control, IDisposable
         Cursor = Cursors.IBeam;
 
         FontFamily = new FontFamily("Cascadia Mono, Consolas, Courier New");
-        FontSize = 13;
+
+        // Bind the terminal's font size to the global application font size metric.
+        // ZoomManager dynamically updates this resource.
+        SetResourceReference(FontSizeProperty, "AppFontSize");
 
         _screen = new VtScreen(80, 25);
         _screen.ClipboardCopyRequested += OnClipboardCopyRequested;
 
         _timer = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(33) };
         _timer.Tick += OnTick;
+
+        // Force a theme refresh on first render
+        RefreshTheme();
+
+        // Listen for OS level theme changes
+        Microsoft.Win32.SystemEvents.UserPreferenceChanged += (s, e) =>
+        {
+            if (e.Category == Microsoft.Win32.UserPreferenceCategory.General ||
+                e.Category == Microsoft.Win32.UserPreferenceCategory.Color)
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    RefreshTheme();
+                    InvalidateVisual();
+                }));
+            }
+        };
+
+        // Listen for internal app theme toggles
+        ThemeManager.ThemeChanged += (s, e) =>
+        {
+            RefreshTheme();
+            InvalidateVisual();
+        };
     }
 
     private void OnClipboardCopyRequested(string text)
@@ -166,7 +193,11 @@ public sealed class TerminalControl : Control, IDisposable
         _screen.Resize(cols, rows);
 
         IsNetworkError = false;
-        WriteLocal("\u001bc");
+
+        // Reset scroll position and fully clear the screen and scrollback history
+        // \u001bc resets the terminal state, \x1b[3J clears the scrollback buffer
+        _scrollOffset = 0;
+        WriteLocal("\u001bc\x1b[3J");
 
         _lastTickTime = DateTime.UtcNow;
         _lastActivityTime = DateTime.UtcNow;
@@ -221,14 +252,36 @@ public sealed class TerminalControl : Control, IDisposable
         {
             ITerminalSession? session = null;
             Exception? error = null;
+            int maxRetries = 3;
 
-            try
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
-                session = new SshShellSession(sessionInfo, cols, rows);
-            }
-            catch (Exception ex)
-            {
-                error = ex;
+                try
+                {
+                    error = null;
+                    if (attempt > 1)
+                    {
+                        // Notify the user about the reconnection attempt on the UI thread
+                        Dispatcher.BeginInvoke(new Action(() =>
+                            WriteLocal($"\r\n[Attempt {attempt}/{maxRetries}] Reconnecting to SSH...\r\n")));
+
+                        // Wait for 2 seconds before the next attempt to allow network stabilization
+                        System.Threading.Thread.Sleep(2000);
+                    }
+
+                    // Attempt to establish the SSH connection
+                    session = new SshShellSession(sessionInfo, cols, rows);
+
+                    // If no exception occurred, the connection was successful, break the retry loop
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    error = ex;
+
+                    // If the user closed the terminal window during the attempts, abort immediately
+                    if (_pendingSshSession == null && _session == null) break;
+                }
             }
 
             Dispatcher.BeginInvoke(new Action(() =>
@@ -256,6 +309,11 @@ public sealed class TerminalControl : Control, IDisposable
 
                 _session = session;
                 _pendingSshSession = null;
+
+                // Reset scroll and wipe the entire history of connection errors/attempts
+                _scrollOffset = 0;
+                WriteLocal("\u001bc\x1b[3J");
+
                 WireSessionEvents();
             }));
         });
@@ -266,23 +324,37 @@ public sealed class TerminalControl : Control, IDisposable
         if (_session == null) return;
 
         _session.Output += (buffer, count) =>
-        {
-            _lastActivityTime = DateTime.UtcNow;
-            var copy = new char[count];
-            Array.Copy(buffer, copy, count);
-            _pending.Enqueue(copy);
+                {
+                    _lastActivityTime = DateTime.UtcNow;
 
-            // Replaces Dispatcher.BeginInvoke flooding with a lightweight flag
-            _scrollPending = true;
-        };
+                    // Rent an array from the shared pool to avoid allocating new memory on the heap
+                    var rented = System.Buffers.ArrayPool<char>.Shared.Rent(count);
+                    Array.Copy(buffer, rented, count);
+
+                    _pending.Enqueue((rented, count));
+
+                    // Replaces Dispatcher.BeginInvoke flooding with a lightweight flag
+                    _scrollPending = true;
+                };
 
         _session.Exited += () => Dispatcher.BeginInvoke(new Action(() =>
-        {
-            WriteLocal("\r\n\r\n[Session closed by remote host]\r\n");
-            Stop();
-            SessionExited?.Invoke(this, EventArgs.Empty);
-            Keyboard.ClearFocus();
-        }));
+                {
+                    if (_session == null) return; // Already handled by OnTick or manual Stop
+
+                    if (IsSshSession && !_session.IsRunning)
+                    {
+                        IsNetworkError = true;
+                        WriteLocal("\r\n\r\n[Network error: Connection lost]\r\n");
+                    }
+                    else
+                    {
+                        WriteLocal("\r\n\r\n[Session closed by remote host]\r\n");
+                    }
+
+                    Stop();
+                    SessionExited?.Invoke(this, EventArgs.Empty);
+                    Keyboard.ClearFocus();
+                }));
 
         _timer.Start();
         InvalidateVisual();
@@ -304,6 +376,12 @@ public sealed class TerminalControl : Control, IDisposable
 
         _timer.Stop();
 
+        // Clear stale output from the dead session to prevent it from bleeding into the next one
+        while (_pending.TryDequeue(out var chunk))
+        {
+            System.Buffers.ArrayPool<char>.Shared.Return(chunk.Buffer);
+        }
+
         var sessionToDispose = _session;
         _session = null;
 
@@ -320,22 +398,56 @@ public sealed class TerminalControl : Control, IDisposable
 
     public void SendCommand(string command) => SafeWrite(command + "\r");
 
+    // Allows sending raw text/sequences without an automatic newline
+    public void SendText(string text) => SafeWrite(text);
+
     public void ChangeDirectory(string path)
     {
         if (_session == null || string.IsNullOrWhiteSpace(path)) return;
         if (_session is SshShellSession) return;
-        SafeWrite($"cd \"{path.TrimEnd('\\')}\"\r");
+
+        try
+        {
+            // Escape first so PSReadLine drops the current edit line, then cd.
+            _session.Write("\x1b");
+
+            string cmd = $"cd \"{path.TrimEnd('\\')}\"";
+
+            // Notify the VT parser that this specific string should be blanked out.
+            // This removes visual noise without desyncing cursor coordinates with ConPTY.
+            _screen.SuppressNextEcho(cmd);
+
+            _session.Write(cmd + "\r");
+        }
+        catch
+        {
+            IsNetworkError = true;
+            WriteLocal("\r\n\r\n[Network error: Connection timed out or lost]\r\n");
+            Stop();
+            SessionExited?.Invoke(this, EventArgs.Empty);
+            Keyboard.ClearFocus();
+        }
     }
 
     private void WriteLocal(string text)
     {
-        var chars = text.ToCharArray();
-        _screen.Write(chars, chars.Length);
+        // Implicitly converts string to ReadOnlySpan<char> without heap allocations
+        _screen.Write(text);
+    }
+
+    private void FlushPendingResize()
+    {
+        if (!_pendingResize.HasValue || _session == null) return;
+
+        var (cols, rows) = _pendingResize.Value;
+        _pendingResize = null;
+        _session.Resize(cols, rows);
     }
 
     private void SafeWrite(string text)
     {
         if (_session == null) return;
+
         try
         {
             _session.Write(text);
@@ -373,7 +485,6 @@ public sealed class TerminalControl : Control, IDisposable
         DateTime now = DateTime.UtcNow;
 
         bool wokeFromSleep = (now - _lastTickTime).TotalSeconds > 10;
-        bool isIdleTimeout = (now - _lastActivityTime).TotalMinutes > 15;
 
         // Connection already dead (server reboot, network drop)
         if (_session != null && IsSshSession && !_session.IsRunning)
@@ -387,11 +498,12 @@ public sealed class TerminalControl : Control, IDisposable
             return;
         }
 
-        if (_session != null && IsSshSession && (wokeFromSleep || isIdleTimeout))
+        // Dropped idle timeout check. Users might run long compilations or watch logs.
+        // We only drop the connection on system wake-up, as the network interface usually resets.
+        if (_session != null && IsSshSession && wokeFromSleep)
         {
             IsNetworkError = true;
-            string reason = wokeFromSleep ? "System wake-up" : "Inactivity timeout";
-            WriteLocal($"\r\n\r\n[{reason} detected. Dropping stale SSH connection...]\r\n");
+            WriteLocal("\r\n\r\n[System wake-up detected. Dropping stale SSH connection...]\r\n");
 
             Stop();
             SessionExited?.Invoke(this, EventArgs.Empty);
@@ -406,13 +518,27 @@ public sealed class TerminalControl : Control, IDisposable
         // Execute pending resize if 150ms has passed since the last window size change
         if (_pendingResize.HasValue && (now - _lastResizeTime).TotalMilliseconds > 150)
         {
-            _session?.Resize(_pendingResize.Value.cols, _pendingResize.Value.rows);
+            var (cols, rows) = _pendingResize.Value;
             _pendingResize = null;
+
+            _session?.Resize(cols, rows);
         }
 
         int scrollbackBefore = _screen.Scrollback.Count;
 
-        while (_pending.TryDequeue(out var chunk)) _screen.Write(chunk, chunk.Length);
+        bool wrote = false;
+        while (_pending.TryDequeue(out var chunk))
+        {
+            // Pass the exact rented length as a Span
+            _screen.Write(chunk.Buffer.AsSpan(0, chunk.Length));
+            wrote = true;
+
+            // Return the array back to the pool immediately after writing to the screen
+            System.Buffers.ArrayPool<char>.Shared.Return(chunk.Buffer);
+        }
+
+        // Once per batch, before the frame is drawn
+        if (wrote) _screen.MaskSuppressedCommands();
 
         // Handle auto-scroll efficiently on the render tick
         if (_scrollPending)
@@ -425,7 +551,24 @@ public sealed class TerminalControl : Control, IDisposable
         if (_scrollOffset > 0 && added > 0)
             _scrollOffset = Math.Min(_scrollOffset + added, _screen.Scrollback.Count);
 
-        if (++_caretTicks >= 15) { _caretTicks = 0; _caretOn = !_caretOn; InvalidateVisual(); return; }
+        // =====================================================================
+        // The blink redraws the whole terminal, so it only happens when the
+        // caret is actually drawn (see OnRender). It used to fire twice a
+        // second regardless: a visible terminal that did not have focus, which
+        // is most of the time while working in the panes, was fully repainted
+        // for a caret it never shows. With CPU rendering that was steady load
+        // for nothing. Focus changes repaint on their own (OnGot/LostKeyboardFocus).
+        // =====================================================================
+        if (++_caretTicks >= 15)
+        {
+            _caretTicks = 0;
+            if (_screen.CursorVisible && IsFocused && _scrollOffset == 0)
+            {
+                _caretOn = !_caretOn;
+                InvalidateVisual();
+                return;
+            }
+        }
 
         if (_screen.Version != _renderedVersion) InvalidateVisual();
 
@@ -466,7 +609,6 @@ public sealed class TerminalControl : Control, IDisposable
     {
         base.OnRenderSizeChanged(info);
         if (ActualWidth <= 0 || ActualHeight <= 0) return;
-
         if (_startPending)
         {
             if (_pendingSshSession != null) TryStartSshSession();
@@ -474,19 +616,17 @@ public sealed class TerminalControl : Control, IDisposable
             return;
         }
 
-        MeasureCell();
         var (cols, rows) = MeasureGrid();
 
-        // Resize local buffer immediately for smooth WPF rendering
-        _screen.Resize(cols, rows);
+        if (cols != _screen.Cols || rows != _screen.Rows)
+        {
+            _screen.Resize(cols, rows);
+            if (_scrollOffset > 0) _scrollOffset = Math.Min(_scrollOffset, _screen.Scrollback.Count);
+        }
 
-        // Debounce remote session resize to prevent terminal flooding
         _pendingResize = (cols, rows);
         _lastResizeTime = DateTime.UtcNow;
-
-        InvalidateVisual();
     }
-
     private bool TryGetLine(int absolute, out Cell[] source, out int start, out int width)
     {
         var scrollback = _screen.Scrollback;
@@ -668,12 +808,8 @@ public sealed class TerminalControl : Control, IDisposable
 
     private static readonly byte[] CubeSteps = { 0, 95, 135, 175, 215, 255 };
 
-    private void RefreshTheme()
+    public void RefreshTheme()
     {
-        long now = Environment.TickCount64;
-        if (_lastThemeCheck >= 0 && now - _lastThemeCheck < ThemeCheckIntervalMs) return;
-        _lastThemeCheck = now;
-
         bool changed = false;
 
         for (int i = 0; i < _palette.Length; i++)
@@ -703,18 +839,23 @@ public sealed class TerminalControl : Control, IDisposable
     protected override void OnRender(DrawingContext dc)
     {
         _renderedVersion = _screen.Version;
-        RefreshTheme();
 
-        // Ensure our buffers are large enough for the current grid width
-        if (_charBuffer.Length < _screen.Cols)
+        // Rebuild structural caches if the grid grows or the font zoom (cell width) changes
+        if (_charBuffer.Length < _screen.Cols || Math.Abs(_cachedCellWidth - _cellWidth) > 0.01)
         {
             _charBuffer = new char[_screen.Cols];
+            _cachedCellWidth = _cellWidth;
 
-            _advanceWidthCache = new double[_screen.Cols + 1][];
+            _zeroAdvancesCache = new double[_screen.Cols + 1][];
+            _glyphOffsetsCache = new Point[_screen.Cols + 1][];
+
             for (int i = 0; i <= _screen.Cols; i++)
             {
-                _advanceWidthCache[i] = new double[i];
-                Array.Fill(_advanceWidthCache[i], _cellWidth);
+                _zeroAdvancesCache[i] = new double[i]; // By default, double arrays are filled with 0.0
+
+                var offsets = new Point[i];
+                for (int j = 0; j < i; j++) offsets[j] = new Point(j * _cellWidth, 0);
+                _glyphOffsetsCache[i] = offsets;
             }
         }
 
@@ -741,7 +882,6 @@ public sealed class TerminalControl : Control, IDisposable
 
                 int length = x - runStart;
                 bool blank = true;
-                bool hasMissingGlyphs = false;
 
                 bool isBold = (first.Flags & CellFlags.Bold) != 0;
                 var glyphTypeface = isBold && _glyphTypefaceBold != null ? _glyphTypefaceBold : _glyphTypefaceNormal;
@@ -750,13 +890,8 @@ public sealed class TerminalControl : Control, IDisposable
                 {
                     char ch = cells[offset + runStart + i].Ch;
                     _charBuffer[i] = ch == '\0' ? ' ' : ch;
-                    if (_charBuffer[i] != ' ') blank = false;
 
-                    // Hybrid Check: If a character is missing from our core font, we flag it
-                    if (glyphTypeface != null && !glyphTypeface.CharacterToGlyphMap.ContainsKey(_charBuffer[i]))
-                    {
-                        hasMissingGlyphs = true;
-                    }
+                    if (_charBuffer[i] != ' ') blank = false;
                 }
 
                 Color fg = Resolve(first.Fg, _defaultFg);
@@ -776,45 +911,46 @@ public sealed class TerminalControl : Control, IDisposable
                 {
                     var fgBrush = BrushFor(fg);
 
-                    if (hasMissingGlyphs || glyphTypeface == null)
+                    // We MUST allocate a new array for glyphs because WPF retains this reference.
+                    ushort[] glyphIndices = new ushort[length];
+
+                    // We can safely reuse these arrays because their contents are identical
+                    // for ANY text run of this exact length, preventing memory allocation spam.
+                    double[] zeroAdvanceWidths = _zeroAdvancesCache[length];
+                    Point[] glyphOffsets = _glyphOffsetsCache[length];
+
+                    // Fallback glyph for missing characters to prevent KeyNotFoundException crashes
+                    ushort fallbackGlyph = 0;
+                    if (glyphTypeface != null)
                     {
-                        // Fallback to FormattedText. Allocates a string, but only runs on rare fallback paths.
-                        var text = new FormattedText(new string(_charBuffer, 0, length), CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
-                            isBold ? _typefaceBold : _typefaceNormal, FontSize, fgBrush, _pixelsPerDip);
-
-                        if ((first.Flags & CellFlags.Underline) != 0) text.SetTextDecorations(TextDecorations.Underline);
-
-                        dc.DrawText(text, new Point(px, py));
+                        glyphTypeface.CharacterToGlyphMap.TryGetValue('?', out fallbackGlyph);
                     }
-                    else
+
+                    for (int i = 0; i < length; i++)
                     {
-                        // GlyphRun retains the indices array until rendering completes, so it MUST be a new array per run.
-                        // However, we completely eliminate allocations for char[] and advanceWidths[]!
-                        ushort[] glyphIndices = new ushort[length];
+                        char ch = _charBuffer[i];
 
-                        // Advance widths are perfectly uniform, so we can safely reuse the cached reference.
-                        double[] advanceWidths = _advanceWidthCache[length];
-
-                        for (int i = 0; i < length; i++)
+                        // Fast path: try to get the exact glyph, fallback to '?' if missing
+                        if (glyphTypeface == null || !glyphTypeface.CharacterToGlyphMap.TryGetValue(ch, out glyphIndices[i]))
                         {
-                            glyphIndices[i] = glyphTypeface.CharacterToGlyphMap[_charBuffer[i]];
+                            glyphIndices[i] = fallbackGlyph;
                         }
+                    }
 
-                        var origin = new Point(px, py + _baseline);
-                        var glyphRun = new GlyphRun(
-                            glyphTypeface, 0, false, FontSize, (float)_pixelsPerDip,
-                            glyphIndices, origin, advanceWidths,
-                            null, null, null, null, null, null);
+                    var origin = new Point(px, py + _baseline);
+                    var glyphRun = new GlyphRun(
+                        glyphTypeface, 0, false, FontSize, (float)_pixelsPerDip,
+                        glyphIndices, origin, zeroAdvanceWidths,
+                        glyphOffsets, null, null, null, null, null);
 
-                        dc.DrawGlyphRun(fgBrush, glyphRun);
+                    dc.DrawGlyphRun(fgBrush, glyphRun);
 
-                        // Reconstruct underline manually
-                        if ((first.Flags & CellFlags.Underline) != 0)
-                        {
-                            double lineThickness = Math.Max(1.0, FontSize / 15.0);
-                            double lineY = py + _baseline + lineThickness + 1;
-                            dc.DrawRectangle(fgBrush, null, new Rect(px, lineY, length * _cellWidth, lineThickness));
-                        }
+                    // Reconstruct underline manually
+                    if ((first.Flags & CellFlags.Underline) != 0)
+                    {
+                        double lineThickness = Math.Max(1.0, FontSize / 15.0);
+                        double lineY = py + _baseline + lineThickness + 1;
+                        dc.DrawRectangle(fgBrush, null, new Rect(px, lineY, length * _cellWidth, lineThickness));
                     }
                 }
             }
@@ -1092,6 +1228,9 @@ public sealed class TerminalControl : Control, IDisposable
 
         _lastActivityTime = DateTime.UtcNow;
 
+        // Switch to manual mode: stop hiding auto-commands so recalled history stays visible
+        _screen.ClearSuppressedCommands();
+
         ClearSelection();
         ScrollToBottom();
         SafeWrite(e.Text);
@@ -1103,6 +1242,10 @@ public sealed class TerminalControl : Control, IDisposable
         if (_session == null) return;
 
         _lastActivityTime = DateTime.UtcNow;
+
+        // Switch to manual mode on any physical key press (like Up/Down arrows)
+        _screen.ClearSuppressedCommands();
+
         Key key = e.Key == Key.System ? e.SystemKey : e.Key;
         bool ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
         bool shift = (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
@@ -1116,6 +1259,32 @@ public sealed class TerminalControl : Control, IDisposable
             Stop();
             SessionExited?.Invoke(this, EventArgs.Empty);
             Keyboard.ClearFocus();
+            e.Handled = true;
+            return;
+        }
+
+        // --- NEW: Clear Terminal (Ctrl + Shift + K) ---
+        // Use Ctrl+Shift+K to avoid breaking Linux apps like nano where Ctrl+K cuts text
+        if (ctrl && shift && key == Key.K)
+        {
+            WriteLocal("\x1bc\x1b[3J");
+            FlushPendingResize();
+
+            if (IsSshSession)
+            {
+                // In Bash, Escape is the Meta key. ESC + 'c' triggers 'capitalize-word'.
+                // To avoid swallowing the 'c' in 'clear', we use Ctrl+U (\x15) instead.
+                // Ctrl+U is the standard Linux shortcut to clear the current input line.
+                _session?.Write("\x15");
+                SafeWrite("clear\r");
+            }
+            else
+            {
+                // In PowerShell/Windows, Escape successfully clears the input line.
+                _session?.Write("\x1b");
+                SafeWrite("cls\r");
+            }
+
             e.Handled = true;
             return;
         }
@@ -1170,5 +1339,29 @@ public sealed class TerminalControl : Control, IDisposable
 
         SafeWrite(sequence);
         e.Handled = true;
+    }
+
+    protected override void OnPropertyChanged(DependencyPropertyChangedEventArgs e)
+    {
+        base.OnPropertyChanged(e);
+
+        // React to global font size scaling triggered by ZoomManager
+        if (e.Property == FontSizeProperty && _session != null)
+        {
+            // Recalculate character cell dimensions based on the new font size
+            MeasureCell();
+
+            // Recalculate how many rows and columns fit in the current physical window size
+            var (cols, rows) = MeasureGrid();
+
+            // Resize the internal VT screen buffer and reflow the text
+            _screen.Resize(cols, rows);
+
+            // Queue the resize for the backend process (ConPTY / SSH)
+            _pendingResize = (cols, rows);
+            _lastResizeTime = DateTime.UtcNow;
+
+            InvalidateVisual();
+        }
     }
 }

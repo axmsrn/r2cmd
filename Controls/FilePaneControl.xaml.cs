@@ -16,7 +16,7 @@ namespace R2Cmd.Controls;
 
 public partial class FilePaneControl : UserControl
 {
-    #region Properties & Fields
+    #region Properties and fields
 
     public string CurrentPath { get; private set; } = "";
     public string SortColumn { get; set; } = "Name";
@@ -63,22 +63,25 @@ public partial class FilePaneControl : UserControl
     private const int DragDelayMs = 180;
     private const double DragThresholdPx = 12;
 
-    // Right-click drag selection state
     private bool _isRightDragSelecting;
     private bool _rightDragTargetState;
+    private bool _rightDragMarkApplied;
     private FileEntry? _lastRightDragItem;
     private Point _rightDragStartPoint;
     private Point _lastRightDragHitPoint;
     private bool _isSearchResults;
-    // Independent forward history stack for this specific pane
-    private readonly Stack<string> _forwardHistory = new();
 
-    // Total size of a volume never changes while the application runs, and asking
-    // for it means touching the drive. One question per root.
+    private readonly Stack<string> _forwardHistory = new();
+    private List<(string Text, string Path)> _crumbParts = new();
+    private readonly List<(FrameworkElement Hit, FrameworkElement? Sep, double Width)> _crumbVisuals = new();
+    private FrameworkElement? _crumbEllipsis;
+    private double _crumbEllipsisWidth;
+    private double _crumbPrefixWidth;
+    private double _lastCrumbAvail = -1;
+
     private static readonly ConcurrentDictionary<string, long> s_driveTotals =
         new(StringComparer.OrdinalIgnoreCase);
 
-    // One shared instance instead of a new brush per breadcrumb segment
     private static readonly Brush s_breadcrumbHoverBrush = CreateFrozen(Color.FromArgb(0x25, 0xFF, 0xFF, 0xFF));
 
     public event EventHandler? PathChanged;
@@ -91,8 +94,9 @@ public partial class FilePaneControl : UserControl
 
     public Func<string, string>? SyncPathResolver;
 
-    [DllImport("user32.dll")]
-    private static extern uint GetDoubleClickTime();
+    // Use .NET 10 source generator for zero-allocation interop
+    [LibraryImport("user32.dll")]
+    private static partial uint GetDoubleClickTime();
 
     #endregion
 
@@ -104,21 +108,14 @@ public partial class FilePaneControl : UserControl
         lvFiles.ItemsSource = Items;
         lvFiles.AddHandler(GridViewColumnHeader.ClickEvent, new RoutedEventHandler(OnColumnHeaderClick));
 
-        // One handler that routes, rather than two that both run on every single
-        // mouse move whether or not anything is being dragged
         lvFiles.PreviewMouseMove += LvFiles_MouseMoveRouter;
-
         lstDrives.PreviewMouseLeftButtonDown += LstDrives_PreviewMouseLeftButtonDown;
-
         lvFiles.PreviewMouseRightButtonDown += LvFiles_PreviewMouseRightButtonDown;
         lvFiles.PreviewMouseRightButtonUp += LvFiles_PreviewMouseRightButtonUp;
-
+        lvFiles.PreviewMouseLeftButtonDown += LvFiles_LoadingParentClick;
         lstDrives.PreviewMouseRightButtonDown += LstDrives_PreviewMouseRightButtonDown;
-
         pnlBreadcrumbs.MouseRightButtonDown += PnlBreadcrumbs_MouseRightButtonDown;
-
-        // Dragging the splitter or resizing the window changes how much room the
-        // Name column may take without pushing Modified out of view
+        pnlBreadcrumbs.SizeChanged += OnBreadcrumbsSizeChanged;
         lvFiles.SizeChanged += (s, e) => AutoSizeNameColumn();
 
         Unloaded += (s, e) =>
@@ -137,7 +134,7 @@ public partial class FilePaneControl : UserControl
 
     #endregion
 
-    #region Loading Animation
+    #region Loading animation
 
     private void StartLoadingAnimation(string parentPath)
     {
@@ -146,7 +143,7 @@ public partial class FilePaneControl : UserControl
         var loadingEntry = new FileEntry
         {
             Name = "..",
-            FullPath = parentPath,
+            FullPath = "",
             IsFolder = true
         };
 
@@ -165,23 +162,50 @@ public partial class FilePaneControl : UserControl
 
             if (lvFiles.ItemContainerGenerator.ContainerFromIndex(0) is ListViewItem lvi)
             {
-                var textBlock = FindVisualTextBlock(lvi);
-                if (textBlock != null)
-                    textBlock.Text = newName;
+                // SetCurrentValue keeps the {Binding Name} alive. A plain
+                // assignment replaced it, and since rows are recycled, the
+                // container later showed ". ." instead of another file's name.
+                _loadingTextBlock = FindVisualTextBlock(lvi);
+                _loadingTextBlock?.SetCurrentValue(TextBlock.TextProperty, newName);
             }
         };
         _loadingAnimTimer.Start();
     }
 
+    private TextBlock? _loadingTextBlock;
+
     private void StopLoadingAnimation()
     {
         _loadingAnimTimer?.Stop();
         _loadingAnimTimer = null;
+
+        // Show the bound name again
+        _loadingTextBlock?.GetBindingExpression(TextBlock.TextProperty)?.UpdateTarget();
+        _loadingTextBlock = null;
     }
 
+    private DateTime _loadingParentClickTime;
+
+    private void LvFiles_LoadingParentClick(object sender, MouseButtonEventArgs e)
+    {
+        if (_loadingAnimTimer == null) return;
+
+        DateTime now = DateTime.UtcNow;
+        int elapsed = (int)(now - _loadingParentClickTime).TotalMilliseconds;
+        _loadingParentClickTime = now;
+
+        if (elapsed <= 0 || elapsed > GetDoubleClickTime())
+            return;
+
+        var entry = Items.FirstOrDefault(i => i.Name == "..");
+        if (entry == null) return;
+
+        e.Handled = true;
+        ItemExecuted?.Invoke(this, entry);
+    }
     #endregion
 
-    #region Drives Bar
+    #region Drive bar
 
     public static List<DriveItem> ScanDrives()
     {
@@ -206,17 +230,24 @@ public partial class FilePaneControl : UserControl
         UpdateDriveSelection();
     }
 
-    public void InitDrives() => ApplyDrives(ScanDrives());
-
     private void UpdateDriveSelection()
     {
         _suppressDriveSelectionChanged = true;
         try
         {
-            // Treat both \\Network and ssh:// paths as "NET" drive
-            string root = (CurrentPath.StartsWith(@"\\") || CurrentPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
-                ? "NET"
-                : (Path.GetPathRoot(CurrentPath) ?? "").TrimEnd('\\');
+            string root;
+            if (CurrentPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
+                root = "";
+            else if (CurrentPath.StartsWith(@"\\"))
+                root = "NET";
+            else
+                root = (Path.GetPathRoot(CurrentPath) ?? "").TrimEnd('\\');
+
+            if (string.IsNullOrEmpty(root))
+            {
+                lstDrives.SelectedItem = null;
+                return;
+            }
 
             foreach (var obj in lstDrives.Items)
             {
@@ -246,522 +277,9 @@ public partial class FilePaneControl : UserControl
         }
     }
 
-    private async Task NavigateToDrive(DriveItem di)
-    {
-        string newRoot;
-        if (di.Name == "NET")
-        {
-            newRoot = !string.IsNullOrEmpty(_lastSshPath) ? _lastSshPath : @"\\Network\";
-        }
-        else
-        {
-            newRoot = di.Name + "\\";
-        }
-
-        string targetPath = SyncPathResolver?.Invoke(newRoot) ?? newRoot;
-
-        PaneGotFocus?.Invoke(this, EventArgs.Empty);
-
-        if (!string.Equals(CurrentPath, targetPath, StringComparison.OrdinalIgnoreCase))
-        {
-            await NavigateAsync(targetPath);
-        }
-        _ = Dispatcher.BeginInvoke(new Action(() => FocusPanel()),
-            System.Windows.Threading.DispatcherPriority.Background);
-    }
-
     #endregion
 
-    #region Navigation Core
-
-    private static bool IsAncestorPath(string current, string target)
-    {
-        if (string.IsNullOrEmpty(current) || string.IsNullOrEmpty(target)) return false;
-
-        int currentLength = TrimmedLength(current);
-        int targetLength = TrimmedLength(target);
-
-        if (targetLength == 0 || currentLength <= targetLength) return false;
-
-        for (int i = 0; i < targetLength; i++)
-        {
-            if (Normalize(current[i]) != Normalize(target[i])) return false;
-        }
-
-        // The next character must be a separator, otherwise C:\Us would look like
-        // an ancestor of C:\Users
-        return IsSeparator(current[targetLength]);
-
-        static bool IsSeparator(char c) => c == '\\' || c == '/';
-        static char Normalize(char c) => char.ToUpperInvariant(c == '/' ? '\\' : c);
-        static int TrimmedLength(string path)
-        {
-            int length = path.Length;
-            while (length > 0 && IsSeparator(path[length - 1])) length--;
-            return length;
-        }
-    }
-
-    public bool CanNavigateForward => _forwardHistory.Count > 0;
-
-    public async Task NavigateForwardAsync()
-    {
-        if (_forwardHistory.Count > 0)
-        {
-            string nextPath = _forwardHistory.Pop();
-            await NavigateAsync(nextPath, null, isForward: true);
-            FocusPanel();
-        }
-    }
-
-    private void PnlSearchPath_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        try
-        {
-            string textToCopy = txtSearchPath.Text ?? "";
-
-            // Remove the "Search results: " prefix if present
-            const string prefix = "Search results: ";
-            if (textToCopy.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                textToCopy = textToCopy.Substring(prefix.Length);
-
-            if (!string.IsNullOrWhiteSpace(textToCopy))
-            {
-                Clipboard.SetText(textToCopy);
-                StatusMessage?.Invoke(this, "Path copied to clipboard.");
-            }
-        }
-        catch { }
-
-        e.Handled = true;
-    }
-
-    public async Task NavigateAsync(string newPath, string? itemToSelect = null, bool isForward = false)
-    {
-        ClearQuickSearch();
-
-        _isSearchResults = false;
-        txtPath.Visibility = Visibility.Visible;
-        pnlSearchPath.Visibility = Visibility.Collapsed;
-
-        // A slow second click may have armed the rename timer just before the
-        // user opened something. Navigation wins.
-        _renameClickTimer?.Stop();
-        _renameClickTimer = null;
-
-        _navCts?.Cancel();
-        _navCts = new CancellationTokenSource();
-        var token = _navCts.Token;
-
-        StopLoadingAnimation();
-        StopWatcher();
-        SetBusy(true);
-
-        bool isSshPath = newPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase);
-        string? sessionName = null;
-
-        try
-        {
-            if (isForward)
-            {
-                // Using forward history (popping) - do not clear it
-            }
-            else if (IsAncestorPath(CurrentPath, newPath))
-            {
-                // Navigating UP - save current path to return to it later
-                _forwardHistory.Push(CurrentPath);
-            }
-            else if (!string.Equals(CurrentPath.TrimEnd('\\', '/'), newPath.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
-            {
-                // Navigating to a different folder (down or side) - clear forward history
-                _forwardHistory.Clear();
-            }
-
-            CurrentPath = newPath;
-            // Remember last network location (SSH, \\Network\LAN, \\PC\share, ...)
-            if (newPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase) ||
-                newPath.StartsWith(@"\\", StringComparison.Ordinal))
-                _lastSshPath = newPath;
-            txtPath.Text = CurrentPath;
-
-            UpdateBreadcrumbs(CurrentPath);
-            pnlBreadcrumbs.Visibility = Visibility.Visible;
-
-            UpdateDriveSelection();
-            PathChanged?.Invoke(this, EventArgs.Empty);
-
-            int currentRequestId = ++_requestId;
-            bool showLoadingAnimation = false;
-
-            if (isSshPath)
-            {
-                sessionName = newPath.Substring(6).TrimEnd('/');
-                int firstSlash = sessionName.IndexOf('/');
-                if (firstSlash > 0) sessionName = sessionName.Substring(0, firstSlash);
-
-                bool sessionOpen = Providers.SshFileSystemProvider.IsSessionOpen(sessionName);
-
-                StatusMessage?.Invoke(this,
-                    sessionOpen
-                        ? "Reading remote folder..."
-                        : $"Connecting to SSH session '{sessionName}'...");
-
-                // Show loading animation only when we actually need to connect
-                if (!sessionOpen)
-                    showLoadingAnimation = true;
-            }
-            else if (newPath.Equals(@"\\Network\LAN", StringComparison.OrdinalIgnoreCase))
-            {
-                StatusMessage?.Invoke(this, "Scanning Windows Network...");
-                showLoadingAnimation = true;
-            }
-
-            if (showLoadingAnimation)
-            {
-                StartLoadingAnimation(@"\\Network");
-                SetBusy(false);
-            }
-
-            // Pass the real cancellation token.
-            // If the user clicks drive C: or D:, the heavy network scan
-            // must stop immediately to free ThreadPool resources.
-            var provider = FileSystemFactory.GetProvider(CurrentPath);
-            var (entries, error) = await provider.ReadDirectoryAsync(CurrentPath, token);
-
-            StopLoadingAnimation();
-
-            if (token.IsCancellationRequested || currentRequestId != _requestId) return;
-
-            // --- SSH EVACUATION LOGIC ---
-            if (isSshPath && error != null)
-            {
-                StatusMessage?.Invoke(this, $"SSH Error: Connection lost. Returning to network root. ({error})");
-
-                if (sessionName != null)
-                {
-                    try { Providers.SshFileSystemProvider.CloseConnection(sessionName); } catch { }
-                }
-
-                _ = Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    _ = NavigateAsync(@"\\Network\");
-                }), System.Windows.Threading.DispatcherPriority.Loaded);
-
-                return;
-            }
-
-            bool atDriveRoot = string.Equals(
-                            Path.GetPathRoot(CurrentPath)?.TrimEnd('\\'),
-                            CurrentPath.TrimEnd('\\'),
-                            StringComparison.OrdinalIgnoreCase);
-
-            bool hasParentEntry = entries.Count > 0 && entries[0].Name == "..";
-
-            if (!atDriveRoot && !hasParentEntry && provider.CanHandle(CurrentPath))
-                entries.Insert(0, new FileEntry { Name = "..", IsFolder = true });
-
-            var sorted = SortEntries(entries);
-
-            Items.ReplaceAll(sorted);
-            AutoSizeNameColumn();
-
-            bool virtualEntries = provider is not Providers.LocalDiskProvider;
-            IconService.QueueLoad(sorted, virtualEntries, currentRequestId, () => _requestId, Dispatcher);
-
-            StartWatcher(CurrentPath, isLocal: !virtualEntries);
-
-            txtSpace.Text = "";
-            _ = UpdateFreeSpaceAsync(provider, CurrentPath, currentRequestId);
-
-            RestoreSelection(itemToSelect);
-            StatusMessage?.Invoke(this, error != null ? $"Error: {error}" : "Ready.");
-        }
-        catch (OperationCanceledException) { }
-        finally
-        {
-            if (!token.IsCancellationRequested)
-            {
-                SetBusy(false);
-            }
-        }
-    }
-
-    public async Task RefreshAsync() => await NavigateAsync(CurrentPath, SelectedItem?.Name);
-
-    public void ShowSearchResults(string searchRoot, IReadOnlyList<FileEntry> results)
-    {
-        _navCts?.Cancel();
-        StopLoadingAnimation();
-        StopWatcher();
-        ClearQuickSearch();
-
-        _isSearchResults = true;
-        CurrentPath = searchRoot;
-
-        txtPath.Visibility = Visibility.Collapsed;
-        pnlSearchPath.Visibility = Visibility.Collapsed;
-
-        pnlBreadcrumbs.Visibility = Visibility.Visible;
-        UpdateBreadcrumbs(searchRoot);   // show the search root as breadcrumbs
-
-        UpdateDriveSelection();
-        PathChanged?.Invoke(this, EventArgs.Empty);
-
-        int requestId = ++_requestId;
-
-        var items = new List<FileEntry>(results.Count + 1)
-    {
-        new FileEntry
-        {
-            Name = "..",
-            IsFolder = true,
-            FullPath = searchRoot
-        }
-    };
-        items.AddRange(results);
-
-        Items.ReplaceAll(items);
-
-        IconService.QueueLoad(items, virtualEntries: false, requestId, () => _requestId, Dispatcher);
-
-        if (items.Count > 1) SetSelectedItem(items[1], takeFocus: true);
-        else if (items.Count > 0) SetSelectedItem(items[0], takeFocus: true);
-
-        StatusMessage?.Invoke(this, $"Search results: {results.Count} item(s). Ctrl+R reloads the folder.");
-    }
-
-    private void SetBusy(bool busy)
-    {
-        if (_isBusy == busy) return;
-
-        _isBusy = busy;
-        BusyStateChanged?.Invoke(this, EventArgs.Empty);
-    }
-
-    private async Task UpdateFreeSpaceAsync(IFileSystemProvider provider, string path, int requestId)
-    {
-        string text = await Task.Run(() =>
-        {
-            try
-            {
-                var freeSpace = provider.GetFreeSpace(path);
-                if (!freeSpace.HasValue) return "";
-
-                string free = Helpers.FormatSize((long)freeSpace.Value);
-
-                string? root = Path.GetPathRoot(path);
-                if (string.IsNullOrEmpty(root) || path.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
-                    return $"{free} free";
-
-                if (!s_driveTotals.TryGetValue(root, out long total))
-                {
-                    try { total = new DriveInfo(root).TotalSize; }
-                    catch { total = 0; }
-
-                    s_driveTotals[root] = total;
-                }
-
-                return total > 0 ? $"{free} of {Helpers.FormatSize(total)} free" : $"{free} free";
-            }
-            catch { return ""; }
-        });
-
-        if (requestId == _requestId) txtSpace.Text = text;
-    }
-
-    public string GetPersistentPath()
-    {
-        // Network and SSH paths always restore to the network root
-        if (CurrentPath.StartsWith(@"\\Network", StringComparison.OrdinalIgnoreCase) ||
-            CurrentPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
-            return @"\\Network\";
-
-        var (archivePath, _) = ArchiveService.ParseVirtualPath(CurrentPath);
-        if (archivePath != null)
-        {
-            string? dir = Path.GetDirectoryName(archivePath);
-            return !string.IsNullOrEmpty(dir) ? dir : archivePath;
-        }
-        return CurrentPath;
-    }
-
-    #endregion
-
-    #region Breadcrumbs
-
-    private void UpdateBreadcrumbs(string path)
-    {
-        spBreadcrumbs.Children.Clear();
-
-        if (string.IsNullOrEmpty(path)) return;
-
-        // When showing search results — add a clear visual indicator
-        if (_isSearchResults)
-        {
-            var searchLabel = new TextBlock
-            {
-                Text = "Search results › ",
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(0, 0, 2, 0),
-                FontWeight = FontWeights.SemiBold
-            };
-            searchLabel.SetResourceReference(TextBlock.ForegroundProperty, "Brush.TextSecondary");
-            searchLabel.SetResourceReference(TextBlock.FontSizeProperty, "AppFilePaneFontSize");
-            spBreadcrumbs.Children.Add(searchLabel);
-        }
-
-        string separator = path.Contains("/") ? "/" : "\\";
-        string prefix = "";
-        string remainingPath = path;
-
-        if (path.StartsWith(@"\\"))
-        {
-            int nextSlash = path.IndexOf('\\', 2);
-            if (nextSlash > 0)
-            {
-                prefix = path.Substring(0, nextSlash + 1);
-                remainingPath = path.Substring(nextSlash + 1);
-            }
-            else
-            {
-                prefix = path;
-                remainingPath = "";
-            }
-        }
-        else if (path.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
-        {
-            int nextSlash = path.IndexOf('/', 6);
-            if (nextSlash > 0)
-            {
-                prefix = path.Substring(0, nextSlash + 1);
-                remainingPath = path.Substring(nextSlash + 1);
-            }
-            else
-            {
-                prefix = path;
-                remainingPath = "";
-            }
-        }
-        else if (path.Contains(":\\"))
-        {
-            prefix = path.Substring(0, 3);
-            remainingPath = path.Substring(3);
-        }
-        else
-        {
-            prefix = path;
-            remainingPath = "";
-        }
-
-        string currentBuiltPath = prefix;
-        AddBreadcrumbItem(prefix, currentBuiltPath);
-
-        if (!string.IsNullOrEmpty(remainingPath))
-        {
-            var parts = remainingPath.Split(new[] { separator }, StringSplitOptions.RemoveEmptyEntries);
-            foreach (var part in parts)
-            {
-                currentBuiltPath += part + separator;
-                AddBreadcrumbItem(part + separator, currentBuiltPath);
-            }
-        }
-    }
-
-    private void AddBreadcrumbItem(string text, string targetPath)
-    {
-        string displayText = text;
-        string trailingSeparator = "";
-
-        if (text.Length > 1 && (text.EndsWith("\\") || text.EndsWith("/")))
-        {
-            displayText = text.Substring(0, text.Length - 1);
-            trailingSeparator = text.Substring(text.Length - 1);
-        }
-
-        var border = new Border
-        {
-            CornerRadius = new CornerRadius(2),
-            Margin = new Thickness(0),
-            Padding = new Thickness(1, 2, 1, 2),
-            Cursor = Cursors.Hand,
-            Background = Brushes.Transparent
-        };
-
-        var tb = new TextBlock
-        {
-            Text = displayText,
-            VerticalAlignment = VerticalAlignment.Center,
-        };
-        tb.SetResourceReference(TextBlock.ForegroundProperty, "Brush.TextPrimary");
-        tb.SetResourceReference(TextBlock.FontSizeProperty, "AppFilePaneFontSize");
-
-        border.Child = tb;
-
-        border.MouseEnter += (s, e) => border.Background = s_breadcrumbHoverBrush;
-        border.MouseLeave += (s, e) => border.Background = Brushes.Transparent;
-
-        border.MouseLeftButtonDown += async (s, e) =>
-        {
-            e.Handled = true;
-            await NavigateAsync(targetPath);
-            FocusPanel();
-        };
-
-        border.MouseRightButtonDown += (s, e) =>
-        {
-            try
-            {
-                Clipboard.SetText(targetPath);
-                StatusMessage?.Invoke(this, $"Path copied: {targetPath}");
-            }
-            catch { }
-            e.Handled = true;
-        };
-
-        spBreadcrumbs.Children.Add(border);
-
-        if (!string.IsNullOrEmpty(trailingSeparator))
-        {
-            var sepTb = new TextBlock
-            {
-                Text = trailingSeparator,
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(0, 0, 1, 0)
-            };
-            sepTb.SetResourceReference(TextBlock.ForegroundProperty, "Brush.TextPrimary");
-            sepTb.SetResourceReference(TextBlock.FontSizeProperty, "AppFilePaneFontSize");
-
-            spBreadcrumbs.Children.Add(sepTb);
-        }
-    }
-
-    private void PnlBreadcrumbs_MouseLeftButtonDown(object sender, MouseButtonEventArgs? e)
-    {
-        pnlBreadcrumbs.Visibility = Visibility.Collapsed;
-        txtPath.Focus();
-        Dispatcher.BeginInvoke(new Action(() => txtPath.SelectAll()), System.Windows.Threading.DispatcherPriority.Input);
-    }
-
-    private void PnlBreadcrumbs_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        try
-        {
-            Clipboard.SetText(CurrentPath);
-            StatusMessage?.Invoke(this, "Full path copied to clipboard.");
-        }
-        catch { }
-        e.Handled = true;
-    }
-
-    private void TxtPath_LostFocus(object sender, RoutedEventArgs e)
-    {
-        pnlBreadcrumbs.Visibility = Visibility.Visible;
-        txtPath.Text = CurrentPath;
-    }
-
-    #endregion
-
-    #region Column Widths
+    #region Column widths
 
     private const double NameColumnMin = 160;
     private bool _columnWidthsPinned;
@@ -825,7 +343,7 @@ public partial class FilePaneControl : UserControl
 
     #endregion
 
-    #region Interaction & Selection
+    #region Selection
 
     private void LvFiles_MouseMoveRouter(object sender, MouseEventArgs e)
     {
@@ -840,18 +358,15 @@ public partial class FilePaneControl : UserControl
 
     private void LvFiles_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
     {
-        var listViewItem = FindAncestor<ListViewItem>((DependencyObject)e.OriginalSource);
+        var entry = EntryFromSource(e.OriginalSource);
 
-        if (listViewItem != null && listViewItem.DataContext is FileEntry entry && entry.Name != "..")
+        if (entry != null && entry.Name != "..")
         {
             _rightDragStartPoint = e.GetPosition(lvFiles);
             _lastRightDragHitPoint = _rightDragStartPoint;
 
-            bool newState = !entry.IsMarked;
-            entry.IsMarked = newState;
-            UpdateMarkedStatus();
-
-            _rightDragTargetState = newState;
+            _rightDragTargetState = !entry.IsMarked;
+            _rightDragMarkApplied = false;
             _isRightDragSelecting = true;
             _lastRightDragItem = entry;
 
@@ -864,34 +379,34 @@ public partial class FilePaneControl : UserControl
 
     private void LvFiles_PreviewMouseRightButtonUp(object sender, MouseButtonEventArgs e)
     {
-        if (_isRightDragSelecting)
+        if (!_isRightDragSelecting) return;
+
+        _isRightDragSelecting = false;
+        lvFiles.ReleaseMouseCapture();
+
+        Point currentPos = e.GetPosition(lvFiles);
+        bool wasDragging = Math.Abs(currentPos.X - _rightDragStartPoint.X) > SystemParameters.MinimumHorizontalDragDistance ||
+                           Math.Abs(currentPos.Y - _rightDragStartPoint.Y) > SystemParameters.MinimumVerticalDragDistance;
+
+        if (wasDragging)
         {
-            _isRightDragSelecting = false;
-            lvFiles.ReleaseMouseCapture();
+            e.Handled = true;
+            return;
+        }
 
-            Point currentPos = e.GetPosition(lvFiles);
-            bool wasDragging = Math.Abs(currentPos.X - _rightDragStartPoint.X) > SystemParameters.MinimumHorizontalDragDistance ||
-                               Math.Abs(currentPos.Y - _rightDragStartPoint.Y) > SystemParameters.MinimumVerticalDragDistance;
+        if (_lastRightDragItem != null && _lastRightDragItem.Name != "..")
+        {
+            var owner = Window.GetWindow(this);
+            var paths = SelectedItems.Select(i => i.FullPath).ToList();
+            if (paths.Count == 0 && _lastRightDragItem != null)
+                paths.Add(_lastRightDragItem.FullPath);
 
-            if (wasDragging)
+            Dispatcher.BeginInvoke(new Action(() =>
             {
-                e.Handled = true;
-            }
-            else
-            {
-                if (_lastRightDragItem != null && _lastRightDragItem.Name != "..")
-                {
-                    string fullPath = _lastRightDragItem.FullPath;
-                    var owner = Window.GetWindow(this);
+                WindowsContextMenu.Show(paths, owner);
+            }), System.Windows.Threading.DispatcherPriority.ContextIdle);
 
-                    Dispatcher.BeginInvoke(new Action(() =>
-                    {
-                        WindowsContextMenu.Show(fullPath, owner);
-                    }), System.Windows.Threading.DispatcherPriority.ContextIdle);
-
-                    e.Handled = true;
-                }
-            }
+            e.Handled = true;
         }
     }
 
@@ -911,37 +426,26 @@ public partial class FilePaneControl : UserControl
 
         if (!hasMoved) return;
 
+        if (!_rightDragMarkApplied && _lastRightDragItem != null)
+        {
+            _lastRightDragItem.IsMarked = _rightDragTargetState;
+            _rightDragMarkApplied = true;
+            UpdateMarkedStatus();
+        }
+
         if (Math.Abs(currentPosition.Y - _lastRightDragHitPoint.Y) < 2) return;
         _lastRightDragHitPoint = currentPosition;
 
-        var hitTestResult = VisualTreeHelper.HitTest(lvFiles, currentPosition);
-        if (hitTestResult == null) return;
+        var hit = lvFiles.InputHitTest(currentPosition) as DependencyObject;
+        var entry = EntryFromSource(hit);
 
-        var listViewItem = FindAncestor<ListViewItem>(hitTestResult.VisualHit);
-        if (listViewItem?.DataContext is not FileEntry entry || entry.Name == "..") return;
+        if (entry == null || entry.Name == "..") return;
 
         if (entry != _lastRightDragItem)
         {
             entry.IsMarked = _rightDragTargetState;
             _lastRightDragItem = entry;
             UpdateMarkedStatus();
-        }
-    }
-
-    private async void OnPathKeyDown(object sender, KeyEventArgs e)
-    {
-        if (e.Key == Key.Enter)
-        {
-            e.Handled = true;
-            string newPath = txtPath.Text;
-
-            if (!newPath.StartsWith(@"\\") && !newPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase) && !newPath.EndsWith("\\"))
-            {
-                newPath += "\\";
-            }
-
-            await NavigateAsync(newPath);
-            FocusPanel();
         }
     }
 
@@ -1090,7 +594,7 @@ public partial class FilePaneControl : UserControl
 
     #endregion
 
-    #region Visual Tree Helpers
+    #region Visual tree helpers
 
     private static TextBlock? FindVisualTextBlock(DependencyObject root)
     {

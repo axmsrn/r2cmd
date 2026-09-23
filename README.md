@@ -2,10 +2,10 @@
 
 [![License: Non-Commercial](https://img.shields.io/badge/License-Non--Commercial-red.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue.svg)](https://www.microsoft.com/windows)
-[![.NET](https://img.shields.io/badge/.NET-8.0-512BD4.svg)](https://dotnet.microsoft.com/)
+[![.NET](https://img.shields.io/badge/.NET-10.0-512BD4.svg)](https://dotnet.microsoft.com/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-A fast, lightweight dual-pane file manager for Windows built with WPF and .NET 8.
+A fast, lightweight dual-pane file manager for Windows built with WPF and .NET 10.
 Designed around minimalism — only what's necessary, nothing extra.
 Optimized for performance, keyboard efficiency, and seamless remote workflows.
 Ships as a single portable executable with built-in SSH/SFTP support.
@@ -52,15 +52,15 @@ _Dual-pane interface with local file system and SSH remote server_
 
 ### Download
 
-Get the latest release from [Releases page](https://github.com/axmsrn/R2Cmd/releases). Unpack and run `R2Cmd.exe` — no installation needed.
+Get the latest release from [Releases page](https://github.com/axmsrn/r2cmd-public/releases). Unpack and run `R2Cmd.exe` — no installation needed.
 
 ### Build from Source
 
 **Prerequisites:** Windows 10/11 x64, [.NET 8.0 SDK](https://dotnet.microsoft.com/download), Git
 
 ```powershell
-git clone https://github.com/axmsrn/R2Cmd.git
-cd R2Cmd
+git clone https://github.com/axmsrn/r2cmd-public.git
+cd r2cmd-public
 
 # Debug
 dotnet build -c Debug
@@ -101,7 +101,7 @@ There is also a built-in editor.
 - [ ] FTP/FTPS support
 - [ ] Archive preview (7z, RAR, TAR)
 
-See [GitHub Issues](https://github.com/axmsrn/R2Cmd/issues) for full tracking.
+See [GitHub Issues](https://github.com/axmsrn/r2cmd-public/issues) for full tracking.
 
 ---
 
@@ -145,8 +145,8 @@ See the [LICENSE](LICENSE) file for full details.
 
 ## 📞 Contact
 
-- **Repository**: [github.com/axmsrn/R2Cmd](https://github.com/axmsrn/R2Cmd)
-- **Issues**: [GitHub Issues](https://github.com/axmsrn/R2Cmd/issues)
+- **Repository**: [github.com/axmsrn/r2cmd-public](https://github.com/axmsrn/r2cmd-public)
+- **Issues**: [GitHub Issues](https://github.com/axmsrn/r2cmd-public/issues)
 - **Email**: axmsrn@gmail.com
 
 ---

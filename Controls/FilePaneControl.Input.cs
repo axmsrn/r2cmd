@@ -1,5 +1,11 @@
+using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Enumeration;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -13,7 +19,7 @@ public partial class FilePaneControl
     {
         public List<FileEntry> Items { get; }
         public bool IsMove { get; }
-        public string TargetPath { get; } // ADDED: Specific destination path
+        public string TargetPath { get; }
 
         public FilesDroppedEventArgs(List<FileEntry> items, bool isMove, string targetPath)
         {
@@ -84,15 +90,6 @@ public partial class FilePaneControl
     // The window level hotkey handler needs this to leave Space to the filter.
     public bool IsQuickSearchActive => !string.IsNullOrEmpty(_quickSearchText);
 
-    // =========================================================================
-    // Rows the user can actually see.
-    //
-    // Quick search filters the ICollectionView, not the Items collection, so
-    // lvFiles.Items and Items are two different sets while a filter is on.
-    // Anything driven by what the user sees must read this one.
-    // =========================================================================
-    private IEnumerable<FileEntry> VisibleEntries => lvFiles.Items.OfType<FileEntry>();
-
     // Resolves the currently focused or selected ListViewItem.
     private ListViewItem? GetFocusedOrSelectedContainer()
     {
@@ -105,30 +102,27 @@ public partial class FilePaneControl
         object? targetItem = lvFiles.SelectedItem ?? (lvFiles.Items.Count > 0 ? lvFiles.Items[0] : null);
         if (targetItem == null) return null;
 
-        // UpdateLayout is a full synchronous layout pass. It is only needed when
-        // virtualization has not realized the container yet — which is the rare
-        // case, not the one on every arrow key.
-        if (lvFiles.ItemContainerGenerator.ContainerFromItem(targetItem) is ListViewItem realized)
-            return realized;
-
-        lvFiles.UpdateLayout();
+        // Return the container if it is already realized.
+        // We drop the forced UpdateLayout() here to prevent UI thread stalling.
         return lvFiles.ItemContainerGenerator.ContainerFromItem(targetItem) as ListViewItem;
     }
 
-    // Scrolls an item into view and gives it the keyboard focus, forcing a layout
-    // pass only when its container does not exist yet.
+    // Scrolls an item into view and gives it the keyboard focus asynchronously.
+    // This avoids forcing a synchronous layout pass (UpdateLayout),
+    // eliminating micro-freezes during rapid keyboard navigation.
     private void FocusListItem(object item)
     {
         lvFiles.ScrollIntoView(item);
 
-        var container = lvFiles.ItemContainerGenerator.ContainerFromItem(item) as ListViewItem;
-        if (container == null)
+        // Yield to the UI thread to allow the virtualizing panel to realize the new container
+        // before we attempt to focus it
+        Dispatcher.BeginInvoke(new Action(() =>
         {
-            lvFiles.UpdateLayout();
-            container = lvFiles.ItemContainerGenerator.ContainerFromItem(item) as ListViewItem;
-        }
-
-        container?.Focus();
+            if (lvFiles.ItemContainerGenerator.ContainerFromItem(item) is ListViewItem container)
+            {
+                container.Focus();
+            }
+        }), DispatcherPriority.Loaded);
     }
 
     private void MoveFocusToNextItem(int currentIndex)
@@ -139,7 +133,7 @@ public partial class FilePaneControl
 
     public void ClearSelection()
     {
-        if (_renamingEntry != null) return; // FIX: Block clearing selection during rename
+        if (_renamingEntry != null) return; // Block clearing selection during rename
 
         // Clearing covers everything, including rows hidden by a quick search
         // filter, because those marks would otherwise survive invisibly
@@ -154,7 +148,7 @@ public partial class FilePaneControl
 
     public void SelectAllFiles()
     {
-        // FIX: Redirect Ctrl+A to the text box if renaming is in progress
+        // Redirect Ctrl+A to the text box if renaming is in progress
         if (_renamingEntry != null)
         {
             if (_renameBox != null)
@@ -167,16 +161,14 @@ public partial class FilePaneControl
 
         var container = GetFocusedOrSelectedContainer();
 
-        // =====================================================================
-        // Visible rows only.
-        //
-        // This used to walk Items, which ignores the quick search filter: with
-        // "log" typed in, the pane showed three files, Ctrl+A silently marked the
-        // whole folder, and the next F8 sent all of it to the recycle bin. The
-        // "is everything already marked" test had the same flaw and was answered
-        // by rows the user could not see.
-        // =====================================================================
-        var selectable = VisibleEntries.Where(i => i.Name != "..").ToList();
+        // Avoid LINQ OfType() and ToList() overhead on the UI collection
+        var selectable = new List<FileEntry>(lvFiles.Items.Count);
+        foreach (var item in lvFiles.Items)
+        {
+            if (item is FileEntry entry && entry.Name != "..")
+                selectable.Add(entry);
+        }
+
         if (selectable.Count == 0) return;
 
         bool targetState = !selectable.All(i => i.IsMarked);
@@ -208,12 +200,9 @@ public partial class FilePaneControl
         }
     }
 
-    // =========================================================================
-    // Bound to PreviewMouseLeftButtonDown in the XAML, so it only ever sees the
-    // left button. The right button is handled by LvFiles_PreviewMouseRightButtonDown
-    // in FilePaneControl.xaml.cs; the branches that used to test for it here
-    // could never run.
-    // =========================================================================
+    private bool _ctrlClickAddedMark;
+    private FileEntry? _ctrlClickItem;
+
     private void LvFiles_PreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
         PaneGotFocus?.Invoke(this, EventArgs.Empty);
@@ -221,6 +210,7 @@ public partial class FilePaneControl
 
         _dragStartPoint = null;
         _dragStartItem = null;
+        _ctrlClickItem = null;
 
         var itemUnderMouse = EntryFromSource(e.OriginalSource);
         if (itemUnderMouse == null) FocusPanel();
@@ -241,25 +231,67 @@ public partial class FilePaneControl
             return;
         }
 
+        _selectionAtMouseDown = lvFiles.SelectedItem as FileEntry;
+
+        // Record drag origin before any modifier checks. This allows starting a drag
+        // immediately after a Shift-click or Ctrl-click, just like in Total Commander.
+        if (itemUnderMouse != null && itemUnderMouse.Name != "..")
+        {
+            _dragStartPoint = e.GetPosition(null);
+            _dragStartItem = itemUnderMouse;
+            _dragStartTime = DateTime.UtcNow;
+        }
+
         if (Keyboard.Modifiers == ModifierKeys.Control &&
             itemUnderMouse != null && itemUnderMouse.Name != "..")
         {
             e.Handled = true;
-            itemUnderMouse.IsMarked = !itemUnderMouse.IsMarked;
-            UpdateMarkedStatus();
+            _ctrlClickItem = itemUnderMouse;
+
+            // Do not unmark an already marked item on MouseDown. If we do, starting a drag
+            // on a marked item with Ctrl held will deselect it and drag only that single file.
+            // Unmarking is deferred to MouseUp if no drag occurred.
+            if (!itemUnderMouse.IsMarked)
+            {
+                itemUnderMouse.IsMarked = true;
+                _ctrlClickAddedMark = true;
+                UpdateMarkedStatus();
+            }
+            else
+            {
+                _ctrlClickAddedMark = false;
+            }
 
             lvFiles.SelectedItem = itemUnderMouse;
             FocusListItem(itemUnderMouse);
             return;
         }
 
-        _selectionAtMouseDown = lvFiles.SelectedItem as FileEntry;
-
-        if (itemUnderMouse != null && itemUnderMouse.Name != "..")
+        if (Keyboard.Modifiers == ModifierKeys.Shift && itemUnderMouse != null)
         {
-            _dragStartPoint = e.GetPosition(null);
-            _dragStartItem = itemUnderMouse;
-            _dragStartTime = DateTime.UtcNow;
+            e.Handled = true;
+
+            var from = lvFiles.SelectedItem as FileEntry ?? itemUnderMouse;
+            int a = lvFiles.Items.IndexOf(from);
+            int b = lvFiles.Items.IndexOf(itemUnderMouse);
+            if (a < 0) a = b;
+
+            if (b >= 0)
+            {
+                int fromIdx = Math.Min(a, b);
+                int toIdx = Math.Max(a, b);
+                for (int i = fromIdx; i <= toIdx; i++)
+                {
+                    if (lvFiles.Items[i] is FileEntry entry && entry.Name != "..")
+                        entry.IsMarked = true;
+                }
+
+                UpdateMarkedStatus();
+            }
+
+            lvFiles.SelectedItem = itemUnderMouse;
+            FocusListItem(itemUnderMouse);
+            return;
         }
     }
 
@@ -272,6 +304,20 @@ public partial class FilePaneControl
 
         var mouseItem = EntryFromSource(e.OriginalSource);
         if (mouseItem == null || mouseItem.Name == "..") return;
+
+        // If Ctrl was held and we clicked an already marked item without dragging, unmark it now.
+        // This ensures unmarking happens correctly without breaking drag-and-drop.
+        if (Keyboard.Modifiers == ModifierKeys.Control)
+        {
+            if (!_ctrlClickAddedMark && mouseItem.IsMarked && ReferenceEquals(mouseItem, _ctrlClickItem))
+            {
+                mouseItem.IsMarked = false;
+                UpdateMarkedStatus();
+            }
+            e.Handled = true;
+            return;
+        }
+
         if (!ReferenceEquals(mouseItem, _selectionAtMouseDown)) return;
 
         ScheduleMouseRename(mouseItem);
@@ -318,6 +364,7 @@ public partial class FilePaneControl
         _renameClickTimer = null;
         _dragStartPoint = null;
         _dragStartItem = null;
+        _ctrlClickItem = null;
 
         var data = new DataObject();
         data.SetData(DataFormats.FileDrop, paths);
@@ -344,7 +391,7 @@ public partial class FilePaneControl
 
     private void LvFiles_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (_renamingEntry != null) return; // FIX: Block arrow navigation during rename
+        if (_renamingEntry != null) return; // Block arrow navigation during rename
 
         if ((e.Key == Key.Up || e.Key == Key.Down) && Keyboard.Modifiers == ModifierKeys.None)
         {
@@ -383,8 +430,6 @@ public partial class FilePaneControl
 
     private void LvFiles_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        // === existing code (leave it as is) ===
-
         // Update path display when in search results mode
         if (_isSearchResults)
         {
@@ -394,7 +439,7 @@ public partial class FilePaneControl
                 if (string.IsNullOrEmpty(dir))
                     dir = entry.FullPath;
 
-                UpdateBreadcrumbs(dir);   // rebuild clickable segments
+                UpdateBreadcrumbs(dir);
             }
             else
             {
@@ -441,18 +486,42 @@ public partial class FilePaneControl
         RecurseSubdirectories = true
     };
 
+    // =========================================================================
+    // Totals of marked folders that have already been counted.
+    //
+    // Every mark used to recount ALL marked folders from scratch: marking ten
+    // folders one by one walked 1+2+...+10 = 55 trees, and over SSH each walk is
+    // a remote command that cannot be cancelled. Now each folder is counted
+    // once and its result reused while it stays marked.
+    //
+    // Keyed by the FileEntry object, not the path: a new listing (navigation or
+    // reload) creates new entries, so stale totals are never looked up again,
+    // and the garbage collector drops them without any clearing code.
+    // =========================================================================
+    private readonly ConditionalWeakTable<FileEntry, FolderTotals> _folderTotals = new();
+
+    private sealed record FolderTotals(long Files, long Bytes);
+
+    /// <summary>
+    /// Takes the totals of a folder counted by the host's folder size scan, so
+    /// the selection status does not walk the same tree a second time.
+    /// </summary>
+    public void SetFolderTotals(FileEntry entry, long files, long bytes)
+    {
+        _folderTotals.AddOrUpdate(entry, new FolderTotals(files, bytes));
+        if (entry.IsMarked) UpdateMarkedStatus();
+    }
+
     private void RecomputeMarkedStatus()
     {
         // We only count explicitly marked items here.
         // We do not count the currently focused item to prevent aggressive
         // disk scanning during normal keyboard navigation (Up/Down arrows).
-        //
-        // A plain loop rather than Where().ToList(): this runs over the entire
-        // listing and the list it used to build was thrown away immediately.
         long directFilesCount = 0;
         long directFoldersCount = 0;
         long directSize = 0;
-        List<string>? foldersToCount = null;
+        int foldersBeingSized = 0;
+        List<FileEntry>? foldersToCount = null;
 
         foreach (var item in Items)
         {
@@ -461,7 +530,24 @@ public partial class FilePaneControl
             if (item.IsFolder)
             {
                 directFoldersCount++;
-                (foldersToCount ??= new List<string>()).Add(item.FullPath);
+
+                // Already counted: only the folders never seen before are scanned
+                if (_folderTotals.TryGetValue(item, out var known))
+                {
+                    directFilesCount += known.Files;
+                    directSize += known.Bytes;
+                }
+                // The folder size scan (Space) is walking this tree right now and
+                // hands its file count over when done: a second walk of the same
+                // tree here only slowed both down
+                else if (item.SizeCalculating)
+                {
+                    foldersBeingSized++;
+                }
+                else
+                {
+                    (foldersToCount ??= new List<FileEntry>()).Add(item);
+                }
             }
             else
             {
@@ -481,8 +567,8 @@ public partial class FilePaneControl
         _selectionCountCts = new CancellationTokenSource();
         var token = _selectionCountCts.Token;
 
-        // If only files are marked, report instantly without spawning background tasks
-        if (foldersToCount == null)
+        // Only files, or folders that are all counted already: report instantly
+        if (foldersToCount == null && foldersBeingSized == 0)
         {
             SetStatusMessage($"Selected: {directFilesCount} file(s) ({Helpers.FormatSize(directSize)})");
             return;
@@ -491,6 +577,9 @@ public partial class FilePaneControl
         // If folders are marked, show an intermediate message and start the background scanner
         SetStatusMessage($"Selected: {directFilesCount} file(s), {directFoldersCount} folder(s) ... calculating...");
 
+        // Nothing to walk here: the size scan reports back through SetFolderTotals
+        if (foldersToCount == null) return;
+
         var folders = foldersToCount;
 
         Task.Run(() =>
@@ -498,17 +587,19 @@ public partial class FilePaneControl
             long totalFiles = directFilesCount;
             long totalSize = directSize;
 
-            foreach (var folder in folders)
+            foreach (var folderEntry in folders)
             {
                 if (token.IsCancellationRequested) return;
+
+                string folder = folderEntry.FullPath;
+                long folderFiles = 0;
+                long folderSize = 0;
 
                 try
                 {
                     if (folder.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
                     {
-                        var (fCount, fSize) = Providers.SshFileSystemProvider.RemoteSumTree(folder);
-                        totalFiles += fCount;
-                        totalSize += fSize;
+                        (folderFiles, folderSize) = Providers.SshFileSystemProvider.RemoteSumTree(folder, token);
                     }
                     else if (Directory.Exists(folder))
                     {
@@ -534,14 +625,22 @@ public partial class FilePaneControl
 
                             foreach (var size in enumerable)
                             {
+                                // A folder abandoned halfway is not stored
                                 if (token.IsCancellationRequested) return;
-                                totalFiles++;
-                                totalSize += size;
+                                folderFiles++;
+                                folderSize += size;
                             }
                         }
                     }
+
+                    // Stored even if this pass gets cancelled right after: the
+                    // next mark reuses the finished folders instead of redoing them
+                    _folderTotals.AddOrUpdate(folderEntry, new FolderTotals(folderFiles, folderSize));
                 }
                 catch { /* Ignore inaccessible folders (Access Denied) */ }
+
+                totalFiles += folderFiles;
+                totalSize += folderSize;
             }
 
             if (token.IsCancellationRequested) return;
@@ -564,12 +663,17 @@ public partial class FilePaneControl
         StatusMessage?.Invoke(this, message);
     }
 
-    // One resolver for mouse and drag events alike: both only ever needed the
-    // original source, and the two copies had drifted apart in name only.
+    // O(1) resolver for mouse and drag events.
+    // Reads DataContext directly instead of walking the visual tree via FindAncestor.
+    // This entirely prevents CPU spikes and UI micro-freezes during rapid mouse movements.
     private static FileEntry? EntryFromSource(object? originalSource)
     {
-        if (originalSource is DependencyObject d && FindAncestor<ListViewItem>(d) is ListViewItem item)
-            return item.DataContext as FileEntry;
+        if (originalSource is FrameworkElement fe)
+            return fe.DataContext as FileEntry;
+
+        if (originalSource is FrameworkContentElement fce)
+            return fce.DataContext as FileEntry;
+
         return null;
     }
 
@@ -628,7 +732,7 @@ public partial class FilePaneControl
 
     public void HandleInsertSelection()
     {
-        if (_renamingEntry != null) return; // FIX: Block Insert during rename
+        if (_renamingEntry != null) return; // Block Insert during rename
 
         var focusedContainer = GetFocusedOrSelectedContainer();
 
@@ -644,7 +748,7 @@ public partial class FilePaneControl
 
     public void HandleSpaceSelection()
     {
-        if (_renamingEntry != null) return; // FIX: Block Space during rename
+        if (_renamingEntry != null) return; // Block Space during rename
 
         var focusedContainer = GetFocusedOrSelectedContainer();
 
@@ -655,7 +759,8 @@ public partial class FilePaneControl
                 entry.IsMarked = !entry.IsMarked;
                 UpdateMarkedStatus();
 
-                if (entry.IsFolder) SizeCalculationRequested?.Invoke(this, entry);
+                // Unmarking a folder with a known size must not walk it again
+                if (entry.IsFolder && !entry.SizeKnown) SizeCalculationRequested?.Invoke(this, entry);
             }
 
             int idx = lvFiles.ItemContainerGenerator.IndexFromContainer(focusedContainer);

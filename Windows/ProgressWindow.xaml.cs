@@ -48,6 +48,61 @@ public partial class ProgressWindow : Window
     // partial Move is never mistaken for a complete one.
     private bool _anythingSkipped;
 
+    // Running count of skipped or failed entries. _anythingSkipped only says
+    // "at least one"; the pack needs to know WHICH top-level items were hit,
+    // and comparing this counter before and after each item tells it.
+    private int _skipCount;
+
+    // =========================================================================
+    // Top-level items whose every file made it into the archive.
+    //
+    // "Delete packed files after archiving" used to recycle ALL selected items
+    // whenever the archive existed at the end, including files that had been
+    // skipped (locked, access denied) and were therefore NOT in the archive.
+    // The host now deletes only what is listed here.
+    // Filled on the worker; read by the host after the window has finished.
+    // =========================================================================
+    private readonly List<FileEntry> _fullyPacked = new();
+
+    // =========================================================================
+    // THE ARCHIVE FILE IS CREATED LAZILY
+    //
+    // It used to be created on disk before the first source file was even
+    // looked at. When every selected file was then skipped (typically one file
+    // open in Excel), an empty .zip appeared in the target pane and vanished
+    // again once the packer deleted it.
+    //
+    // Now the .zip comes into existence at the moment the first entry is about
+    // to be written, which is after that entry's data has already been read
+    // successfully. If nothing is ever written, no file is ever created.
+    // Worker thread only.
+    // =========================================================================
+    private FileStream? _packStream;
+    private ZipArchive? _packZip;
+
+    private ZipArchive PackZip => _packZip ??= CreatePackArchive();
+
+    private ZipArchive CreatePackArchive()
+    {
+        // CreateNew, not Create: the host checked that the name was free, and if
+        // something took it in the meantime it must not be overwritten
+        try
+        {
+            _packStream = new FileStream(_destination, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+            return new ZipArchive(_packStream, ZipArchiveMode.Create, leaveOpen: true);
+        }
+        catch (Exception ex)
+        {
+            // A problem with the archive itself, not with the file being packed:
+            // offering Skip for it would only repeat the error for every file
+            _packStream?.Dispose();
+            _packStream = null;
+            throw new PackFatalException(
+                $"Cannot create the archive \"{Path.GetFileName(_destination)}\":\n{ex.Message}", ex);
+        }
+    }
+    public IReadOnlyList<FileEntry> FullyPackedItems => _fullyPacked;
+
     public bool IsCancelled { get; private set; } = false;
     public int SuccessfullyProcessedFiles { get; private set; } = 0;
 
@@ -126,9 +181,10 @@ public partial class ProgressWindow : Window
         string time = FormatElapsed(_operationStopwatch.Elapsed);
         string head = IsCancelled ? $"{OperationName} canceled" : $"{OperationName} finished";
         string skipped = _anythingSkipped ? ", some items skipped" : "";
+        string instant = _movedByRename > 0 ? $", {_movedByRename} moved instantly" : "";
 
         return $"{head}: {SuccessfullyProcessedFiles} / {_totalFiles} files " +
-               $"({FormatSizeStable(_copiedBytes, padded: false)} / {FormatSizeStable(_totalBytes, padded: false)}){skipped} — Time: {time}";
+               $"({FormatSizeStable(_copiedBytes, padded: false)} / {FormatSizeStable(_totalBytes, padded: false)}){instant}{skipped} — Time: {time}";
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -264,12 +320,24 @@ public partial class ProgressWindow : Window
             return;
         }
 
+        var destProvider = FileSystemFactory.GetProvider(_destination);
+
+        // Items a Move could simply rename are done first; only the rest are
+        // counted and processed file by file below
+        IReadOnlyList<FileEntry> items = _sourceItems;
+
+        if (_operation == FileOperation.Move && destProvider is LocalDiskProvider)
+        {
+            txtCurrentFile.Text = "Moving...";
+            items = await Task.Run(MoveByRename, _cts.Token);
+
+            if (items.Count == 0) return;
+        }
+
         txtCurrentFile.Text = "Calculating total size...";
         PushStatus($"{OperationName}: calculating total size...");
 
-        await Task.Run(() => CalculateTotals(_sourceItems), _cts.Token);
-
-        var destProvider = FileSystemFactory.GetProvider(_destination);
+        await Task.Run(() => CalculateTotals(items), _cts.Token);
 
         // =========================================================================
         // Two phases: work out what every item is, then carry it out.
@@ -281,7 +349,7 @@ public partial class ProgressWindow : Window
         // a solid archive cost five full passes that way; grouped by archive they
         // cost one.
         // =========================================================================
-        var plan = BuildTransferPlan(destProvider);
+        var plan = BuildTransferPlan(items, destProvider);
 
         // =========================================================================
         // The whole loop runs off the UI thread: synchronous fast paths such as a
@@ -316,6 +384,77 @@ public partial class ProgressWindow : Window
         });
     }
 
+    // =========================================================================
+    // MOVE WITHIN ONE VOLUME IS A RENAME
+    //
+    // A move used to walk the whole tree: count every file for the progress
+    // bar, recreate each folder at the destination, move file after file, then
+    // delete the emptied source folders. For node_modules that meant minutes.
+    //
+    // On the same NTFS volume a folder of any size moves with one directory
+    // entry update. Each selected item is first tried as exactly that: one
+    // MoveFileEx call without MOVEFILE_COPY_ALLOWED, so it can only ever
+    // rename, never fall back to a silent unmonitored copy.
+    //
+    // Whatever cannot be renamed goes to the regular path, which reports
+    // problems item by item as before:
+    //   - another volume (different drive, or a folder mounted from one);
+    //   - the destination exists (a folder merge, or a file to overwrite);
+    //   - something inside is in use or access is denied;
+    //   - an archive or remote path on either side.
+    // =========================================================================
+    private int _movedByRename;
+
+    private List<FileEntry> MoveByRename()
+    {
+        var rest = new List<FileEntry>();
+
+        foreach (var item in _sourceItems)
+        {
+            _cts.Token.ThrowIfCancellationRequested();
+
+            string target = Path.Combine(_destination, item.Name);
+
+            if (!CanTryRename(item, target) || !MoveFileEx(item.FullPath, target, 0))
+            {
+                rest.Add(item);
+                continue;
+            }
+
+            _movedByRename++;
+            _totalFiles++;
+            _copiedFiles++;
+            SuccessfullyProcessedFiles++;
+
+            UpdateUi(item.Name, 1, 1, force: false);
+        }
+
+        return rest;
+    }
+
+    private static bool CanTryRename(FileEntry item, string target)
+    {
+        if (item.Name == "..") return false;
+        if (FileSystemFactory.GetProvider(item.FullPath) is not LocalDiskProvider) return false;
+
+        var (archive, internalPath) = ArchiveService.ParseVirtualPath(item.FullPath);
+        if (archive != null && !string.IsNullOrEmpty(internalPath)) return false;
+
+        // Different roots can never be one volume. The reverse is not
+        // guaranteed (a folder can have another volume mounted in it); that
+        // case simply makes MoveFileEx fail and the item takes the regular path.
+        return string.Equals(Path.GetPathRoot(item.FullPath), Path.GetPathRoot(target),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Flags 0: no MOVEFILE_REPLACE_EXISTING (an existing target means a merge
+    // or an overwrite prompt, which the regular path handles) and no
+    // MOVEFILE_COPY_ALLOWED (across volumes it fails instead of copying)
+    [LibraryImport("kernel32.dll", EntryPoint = "MoveFileExW", SetLastError = true,
+        StringMarshalling = StringMarshalling.Utf16)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool MoveFileEx(string lpExistingFileName, string lpNewFileName, uint dwFlags);
+
     private enum PlanKind { Normal, ArchiveFolder, ArchiveFile }
 
     private sealed record PlanStep(PlanKind Kind, FileEntry Item, string TargetPath, string? ArchivePath, string? InternalPath);
@@ -324,12 +463,12 @@ public partial class ProgressWindow : Window
 
     // Classification only: no disk writing happens here, so an unsupported
     // destination is refused before a single byte has been copied.
-    private TransferPlan BuildTransferPlan(IFileSystemProvider destProvider)
+    private TransferPlan BuildTransferPlan(IReadOnlyList<FileEntry> items, IFileSystemProvider destProvider)
     {
-        var steps = new List<PlanStep>(_sourceItems.Count);
+        var steps = new List<PlanStep>(items.Count);
         var fileGroups = new Dictionary<string, List<PlanStep>>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var item in _sourceItems)
+        foreach (var item in items)
         {
             string targetPath = destProvider.CombinePaths(_destination, item.Name);
 
@@ -425,7 +564,11 @@ public partial class ProgressWindow : Window
         SuccessfullyProcessedFiles += written;
 
         // Skipped by the overwrite dialog, or simply not present in the archive
-        if (written < map.Count) _anythingSkipped = true;
+        if (written < map.Count)
+        {
+            _anythingSkipped = true;
+            _skipCount += map.Count - written;
+        }
     }
 
     private void CalculateTotals(IEnumerable<FileEntry> entries)
@@ -797,6 +940,7 @@ public partial class ProgressWindow : Window
     private void UpdateTotalProgressOnSkip(string sourcePath)
     {
         _anythingSkipped = true;
+        _skipCount++;
 
         if (FileSystemFactory.GetProvider(sourcePath) is LocalDiskProvider)
         {
@@ -890,23 +1034,43 @@ public partial class ProgressWindow : Window
             bool success = false;
             try
             {
-                using var fs = new FileStream(_destination, FileMode.Create);
-                using var zip = new ZipArchive(fs, ZipArchiveMode.Create);
-
                 foreach (var item in _sourceItems)
                 {
-                    await PackEntryAsync(zip, item.FullPath, item.Name);
+                    int skippedBefore = _skipCount;
+
+                    await PackEntryAsync(item.FullPath, item.Name, isTopLevel: true);
+
+                    // Nothing inside this item was skipped: it is safe to delete
+                    if (_skipCount == skippedBefore) _fullyPacked.Add(item);
                 }
                 success = true;
             }
             finally
             {
-                if (!success && File.Exists(_destination)) { try { File.Delete(_destination); } catch { } }
+                bool created = _packStream != null;
+                Exception? closeError = null;
+
+                // Disposing the archive writes its central directory. If that
+                // fails (disk full), the file on disk is not a valid ZIP.
+                try { _packZip?.Dispose(); } catch (Exception ex) { closeError = ex; }
+                try { _packStream?.Dispose(); } catch (Exception ex) { closeError ??= ex; }
+
+                _packZip = null;
+                _packStream = null;
+
+                if (created && (!success || closeError != null))
+                {
+                    try { File.Delete(_destination); } catch { }
+                }
+
+                // Only reported when nothing else is already propagating
+                if (success && closeError != null)
+                    throw new IOException($"The archive could not be completed: {closeError.Message}", closeError);
             }
         });
     }
 
-    private async Task PackEntryAsync(ZipArchive zip, string sourcePath, string entryName)
+    private async Task PackEntryAsync(string sourcePath, string entryName, bool isTopLevel = false)
     {
         _cts.Token.ThrowIfCancellationRequested();
 
@@ -917,64 +1081,183 @@ public partial class ProgressWindow : Window
 
             if ((attr & FileAttributes.Directory) != 0)
             {
+                // =============================================================
+                // A junction or directory symlink INSIDE the packed tree is
+                // stored as an empty folder, not followed. Following it packed
+                // the target's contents (which live elsewhere and are not
+                // deleted with this tree), and a link pointing back up the tree
+                // recursed until the path grew too long.
+                // A link selected directly by the user is still followed: that
+                // is an explicit request to pack what it points to.
+                // =============================================================
+                if (!isTopLevel && (attr & FileAttributes.ReparsePoint) != 0)
+                {
+                    PackZip.CreateEntry(entryName + "/");
+                    return;
+                }
+
                 var dir = new DirectoryInfo(sourcePath);
 
                 // Fast empty directory check
                 if (!dir.EnumerateFileSystemInfos().Any())
-                    zip.CreateEntry(entryName + "/");
+                    PackZip.CreateEntry(entryName + "/");
 
                 foreach (var file in dir.EnumerateFiles())
                 {
                     _cts.Token.ThrowIfCancellationRequested();
-                    await PackEntryAsync(zip, file.FullName, entryName + "/" + file.Name);
+                    await PackEntryAsync(file.FullName, entryName + "/" + file.Name);
                 }
 
                 foreach (var subDir in dir.EnumerateDirectories())
                 {
                     _cts.Token.ThrowIfCancellationRequested();
-                    await PackEntryAsync(zip, subDir.FullName, entryName + "/" + subDir.Name);
+                    await PackEntryAsync(subDir.FullName, entryName + "/" + subDir.Name);
                 }
                 return;
             }
 
             string fileName = Path.GetFileName(sourcePath);
 
-            // Optimal instead of SmallestSize: the latter is several times slower for
-            // a size gain that is usually under one percent.
-            var zipEntry = zip.CreateEntry(entryName, CompressionLevel.Optimal);
+            // =================================================================
+            // FileShare.Read, deliberately strict: the file is opened only if no
+            // other program holds it open for writing. A document open in Excel
+            // or Word fails right here, BEFORE anything is written to the
+            // archive, and goes to the Pack Error dialog. Skip then leaves no
+            // trace of it in the archive.
+            //
+            // Sharing ReadWrite would let such a file be read, but its content
+            // may be mid-save, and "Delete packed files after archiving" would
+            // pack it and then fail to recycle it because it is still open.
+            // While this handle is open, no one else can start writing either,
+            // so the packed copy is consistent.
+            // =================================================================
+            await using var sourceStream = new FileStream(
+                sourcePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                81920,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+            await PackFileAsync(sourceStream, sourcePath, entryName, fileName);
+        }
+        catch (OperationCanceledException) { throw; }
+
+        // Not skippable: the archive itself cannot be created, or it already
+        // holds a broken entry for this file
+        catch (PackFatalException) { throw; }
+
+        catch (Exception ex)
+        {
+            HandleErrorDecision(sourcePath, ex, "Pack Error");
+        }
+    }
+
+    // =========================================================================
+    // FILE DATA IS READ BEFORE ITS ARCHIVE ENTRY EXISTS
+    //
+    // A ZipArchive in Create mode cannot remove an entry once it is created.
+    // The old code created the entry first and then read the file; when the read
+    // failed, the user pressed Skip and the archive kept an empty entry for a
+    // file that was never packed.
+    //
+    // Opening the file is not enough of a test. Excel and Word lock byte ranges
+    // of an open document, so the file opens fine and the READ fails. So the
+    // data itself is read first: files up to PackStagingLimit are read in full
+    // into a pooled buffer, and only then is the entry created and written.
+    // Anything unreadable fails while the archive is still untouched, and Skip
+    // leaves no trace of it.
+    //
+    // A file larger than the limit is staged only partly. If it fails past that
+    // point, the entry is already half written and cannot be taken back: that
+    // one case stops the whole pack and deletes the archive, rather than
+    // silently producing an archive with a truncated file in it.
+    // =========================================================================
+    private const int PackStagingLimit = 32 * 1024 * 1024;
+
+    // Ends the whole pack instead of going to the Skip dialog
+    private sealed class PackFatalException(string message, Exception inner)
+        : IOException(message, inner);
+
+    private async Task PackFileAsync(FileStream sourceStream, string sourcePath,
+        string entryName, string fileName)
+    {
+        // Size as of now. A file still growing is packed up to this length;
+        // reading past it could also run into a lock range an application keeps
+        // beyond the end of its file.
+        long totalFileSize = sourceStream.Length;
+        int stagedLength = (int)Math.Min(totalFileSize, PackStagingLimit);
+
+        byte[] staged = ArrayPool<byte>.Shared.Rent(Math.Max(stagedLength, 1));
+        byte[]? buffer = null;
+        bool entryCreated = false;
+
+        try
+        {
+            // 1. Read, with the archive untouched
+            int filled = 0;
+            while (filled < stagedLength)
+            {
+                int n = await sourceStream.ReadAsync(staged.AsMemory(filled, stagedLength - filled), _cts.Token);
+                if (n == 0) break; // the file shrank meanwhile
+
+                filled += n;
+                UpdateUi(fileName, filled, totalFileSize, force: false);
+            }
+
+            // 2. Only now does the entry come into existence
+            // Optimal instead of SmallestSize: the latter is several times slower
+            // for a size gain that is usually under one percent.
+            // The first entry is also the moment the .zip file itself appears
+            var zipEntry = PackZip.CreateEntry(entryName, CompressionLevel.Optimal);
+            entryCreated = true;
+
+            // The file's own time instead of "now", which is what an entry gets
+            // by default. Unpacking then restores the original dates.
+            try { zipEntry.LastWriteTime = File.GetLastWriteTime(sourcePath); } catch { }
 
             await using var entryStream = zipEntry.Open();
-            await using var sourceStream = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, FileOptions.Asynchronous);
 
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(TransferBufferSize);
-            try
+            await entryStream.WriteAsync(staged.AsMemory(0, filled), _cts.Token);
+            long currentFileCopied = filled;
+            _copiedBytes += filled;
+
+            // 3. The rest of a file larger than the staging limit
+            if (filled == stagedLength && totalFileSize > filled)
             {
-                int bytesRead;
-                long currentFileCopied = 0;
-                long totalFileSize = sourceStream.Length;
+                buffer = ArrayPool<byte>.Shared.Rent(TransferBufferSize);
 
-                while ((bytesRead = await sourceStream.ReadAsync(buffer, _cts.Token)) > 0)
+                while (currentFileCopied < totalFileSize)
                 {
+                    int want = (int)Math.Min(buffer.Length, totalFileSize - currentFileCopied);
+                    int bytesRead = await sourceStream.ReadAsync(buffer.AsMemory(0, want), _cts.Token);
+                    if (bytesRead == 0) break;
+
                     await entryStream.WriteAsync(buffer.AsMemory(0, bytesRead), _cts.Token);
                     currentFileCopied += bytesRead;
                     _copiedBytes += bytesRead;
 
                     UpdateUi(fileName, currentFileCopied, totalFileSize, force: false);
                 }
+            }
 
-                _copiedFiles++;
-                SuccessfullyProcessedFiles++;
-                UpdateUi(fileName, totalFileSize, totalFileSize, force: false);
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
-            }
+            _copiedFiles++;
+            SuccessfullyProcessedFiles++;
+            UpdateUi(fileName, totalFileSize, totalFileSize, force: false);
         }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
+        catch (Exception ex) when (entryCreated && ex is not OperationCanceledException)
         {
-            HandleErrorDecision(sourcePath, ex, "Pack Error");
+            throw new PackFatalException(
+                $"\"{fileName}\" could not be read to the end after part of it was already " +
+                $"written to the archive ({ex.Message}).\n\n" +
+                "A ZIP archive being written cannot drop an entry, so the archive was not created " +
+                "and nothing was deleted.",
+                ex);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(staged);
+            if (buffer != null) ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 }

@@ -552,7 +552,7 @@
     </Style>
 
     <Style x:Key="Theme.DriveBarItem" TargetType="{x:Type ListBoxItem}">
-        <Setter Property="Background" Value="{DynamicResource Brush.SurfaceAlt}" />
+        <Setter Property="Background" Value="Transparent" />
         <Setter Property="Foreground" Value="{DynamicResource Brush.TextPrimary}" />
         <Setter Property="Padding" Value="8,2" />
         <Setter Property="Margin" Value="0,0,4,0" />
@@ -562,7 +562,7 @@
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="{x:Type ListBoxItem}">
-                    <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                    <Border x:Name="Bd" Background="Transparent"
                         BorderBrush="{DynamicResource Brush.Border}" BorderThickness="1"
                         Padding="{TemplateBinding Padding}" CornerRadius="3">
                         <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
@@ -575,8 +575,7 @@
                                 Value="{DynamicResource Brush.TextSecondary}" />
                         </Trigger>
                         <Trigger Property="IsSelected" Value="True">
-                            <Setter TargetName="Bd" Property="Background"
-                                Value="{DynamicResource Brush.SurfaceAlt}" />
+                            <Setter TargetName="Bd" Property="Background" Value="Transparent" />
                             <Setter TargetName="Bd" Property="BorderBrush"
                                 Value="{DynamicResource Brush.Accent}" />
                         </Trigger>
@@ -623,8 +622,8 @@
                                 Value="{DynamicResource Brush.Accent}" />
                         </Trigger>
                         <Trigger Property="IsPressed" Value="True">
-                            <Setter TargetName="Bd" Property="Background"
-                                Value="{DynamicResource Brush.Accent}" />
+                            <Setter Property="Foreground"
+                                Value="{DynamicResource Brush.TextPrimary}" />
                         </Trigger>
                         <Trigger Property="IsEnabled" Value="False">
                             <Setter Property="Foreground"
@@ -720,22 +719,29 @@
         <Setter Property="BorderBrush" Value="{DynamicResource Brush.Border}" />
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="4" />
+        <Setter Property="HasDropShadow" Value="True" />
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="{x:Type ContextMenu}">
-                    <Border Background="{TemplateBinding Background}"
-                        BorderBrush="{TemplateBinding BorderBrush}"
-                        BorderThickness="{TemplateBinding BorderThickness}"
-                        Padding="{TemplateBinding Padding}"
-                        CornerRadius="4"
-                        SnapsToDevicePixels="True">
-                        <!-- A long menu used to run off the screen edge with no way to reach
-                             the items below the fold -->
-                        <ScrollViewer VerticalScrollBarVisibility="Auto"
-                            HorizontalScrollBarVisibility="Disabled">
-                            <StackPanel IsItemsHost="True" />
-                        </ScrollViewer>
-                    </Border>
+                    <Grid Margin="0,0,10,10">
+                        <Border Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            Padding="{TemplateBinding Padding}"
+                            CornerRadius="4"
+                            SnapsToDevicePixels="True">
+                            <Border.Effect>
+                                <DropShadowEffect Color="Black" BlurRadius="16"
+                                    ShadowDepth="2" Opacity="0.45" />
+                            </Border.Effect>
+                            <!-- A long menu used to run off the screen edge with no way to reach
+                                 the items below the fold -->
+                            <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                HorizontalScrollBarVisibility="Disabled">
+                                <StackPanel IsItemsHost="True" />
+                            </ScrollViewer>
+                        </Border>
+                    </Grid>
                 </ControlTemplate>
             </Setter.Value>
         </Setter>
@@ -745,6 +751,7 @@
         <Setter Property="Background" Value="Transparent" />
         <Setter Property="Foreground" Value="{DynamicResource Brush.TextPrimary}" />
         <Setter Property="Padding" Value="10,6" />
+        <Setter Property="Cursor" Value="Hand" />
         <Setter Property="FocusVisualStyle" Value="{x:Null}" />
         <Setter Property="Template">
             <Setter.Value>

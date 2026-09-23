@@ -1,10 +1,11 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.IO;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -12,86 +13,126 @@ using System.Windows.Threading;
 
 namespace R2Cmd;
 
-public static class IconService
+// =============================================================================
+// FILE ICONS THROUGH THE WINDOWS SYSTEM IMAGE LIST
+//
+// Windows keeps every distinct file icon exactly once, in the system image list
+// owned by shell32, and identifies it by an integer index. Hundreds of
+// executables with the stock application icon all map to the same index. This
+// is what Total Commander and Explorer are built on.
+//
+// The previous version asked the shell for an HICON per file, copied its pixels
+// into a new BitmapSource and cached that bitmap per FILE. A folder like
+// System32 therefore produced hundreds of identical bitmaps, each one alive in
+// three places (managed wrapper, WIC pixel buffer, render-thread copy), at
+// 32x32 although the list draws them at 16x16.
+//
+// Now:
+//   1. The shell is asked for the icon INDEX (SHGFI_SYSICONINDEX). That is an
+//      int, and it is what gets cached per file and per extension.
+//   2. A bitmap is created once per distinct index, and shared by every row
+//      that shows that icon.
+//   3. The bitmap is taken at the size the list actually needs: the small
+//      system icon (16 px at 100 % DPI) unless the UI zoom or DPI calls for more.
+//
+// Why a WPF bitmap at all instead of drawing straight from the image list the
+// way Total Commander does: ImageList_Draw paints onto a GDI device context,
+// and WPF rows have none. Converting each distinct icon once is the closest a
+// WPF list can get. The flat ImageList_* functions are deliberately not used
+// either: without a comctl32 v6 activation context they bind to comctl32 v5,
+// which must not be handed the shell's v6 image list. Asking SHGetFileInfo for
+// the icon of the file that produced the index gives the same pixels safely.
+// =============================================================================
+public static partial class IconService
 {
     public static bool Enabled = true;
 
-    private static readonly ConcurrentDictionary<string, ImageSource?> s_extCache =
-        new(StringComparer.OrdinalIgnoreCase);
+    // ---------------------------------------------------------------------
+    // Size classes: the two system image lists SHGetFileInfo can hand out
+    // ---------------------------------------------------------------------
+    private const int SizeSmall = 0;    // SM_CXSMICON, 16 px at 100 % DPI
+    private const int SizeLarge = 1;    // SM_CXICON, 32 px at 100 % DPI
+    private const int SizeClassCount = 2;
+
+    // Cached index meaning "the shell has no icon for this", so it is not asked again
+    private const int NoIcon = -1;
 
     private const string NoExtKey = "<none>";
 
-    // A plain array, matched as a span. The HashSet lookup needed a real string,
-    // which meant Path.GetExtension allocating one per file per listing — on the
-    // UI thread, inside TryApplyCachedIcon.
+    // A plain array, matched as a span: no string is allocated per file to test it
     private static readonly string[] s_perFileExtensions =
         { ".exe", ".scr", ".lnk", ".ico", ".cur", ".ani", ".msc", ".cpl" };
 
-    private static bool NeedsPerFileLookup(string name)
-    {
-        int dot = name.LastIndexOf('.');
-        if (dot < 0) return false;
+    // ---------------------------------------------------------------------
+    // Caches. All of them hold ints except the last one, which holds one
+    // bitmap per distinct icon and size class.
+    // ---------------------------------------------------------------------
 
-        var ext = name.AsSpan(dot);
+    // Extension -> system image list index. Deterministic: SHGFI_USEFILEATTRIBUTES
+    // never touches the file, so a miss is remembered as NoIcon.
+    private static readonly ConcurrentDictionary<string, int> s_extIndex =
+        new(StringComparer.OrdinalIgnoreCase);
 
-        foreach (string candidate in s_perFileExtensions)
-        {
-            if (ext.Equals(candidate, StringComparison.OrdinalIgnoreCase)) return true;
-        }
+    // Span view over the same dictionary: the UI-thread fast path looks an
+    // extension up without allocating a substring for it
+    private static readonly ConcurrentDictionary<string, int>.AlternateLookup<ReadOnlySpan<char>> s_extIndexBySpan =
+        s_extIndex.GetAlternateLookup<ReadOnlySpan<char>>();
 
-        return false;
-    }
-
-    private static string ExtensionKey(string name)
-    {
-        int dot = name.LastIndexOf('.');
-        return dot < 0 || dot == name.Length - 1 ? NoExtKey : name.Substring(dot);
-    }
-
-    // A value type key: the previous string form allocated one interpolated
-    // string per file per listing, thousands of them on a large folder, and all
-    // of it on the UI thread inside TryApplyCachedIcon.
+    // =========================================================================
+    // Per-file icons are keyed by name, size and timestamp — deliberately NOT by
+    // path. A move changes only the path, so the index learned while the file
+    // was still in the source folder is a hit the moment it appears in the
+    // destination. The stamp keeps the key honest the other way: a different
+    // build dropped over an old file differs in size or time and misses.
+    // =========================================================================
     private readonly record struct IconKey(string Name, long Ticks, long Size);
 
-    private static readonly ConcurrentDictionary<IconKey, ImageSource?> s_fileCache = new();
+    private static readonly ConcurrentDictionary<IconKey, int> s_fileIndex = new();
 
-    // Insertion order, used to evict the oldest entries instead of wiping the
-    // whole cache when it fills up
+    // Insertion order, used to evict the oldest entries instead of wiping all
     private static readonly ConcurrentQueue<IconKey> s_fileOrder = new();
 
-    // Tracked separately: ConcurrentDictionary.Count takes every lock in the
-    // table, and it was being read on each single icon that got cached
-    private static int s_fileCacheCount;
+    // Tracked separately: ConcurrentDictionary.Count takes every lock in the table
+    private static int s_fileIndexCount;
 
-    private const int FileCacheLimit = 4096;
+    // Entries are ints now, so the cap can be generous
+    private const int FileIndexLimit = 16384;
+
+    // Index -> bitmap, one dictionary per size class. Bounded by the number of
+    // distinct icons on the machine, not by the number of files seen.
+    private static readonly ConcurrentDictionary<int, ImageSource>[] s_indexBitmaps =
+        CreateIndexBitmapCaches();
+
+    private static ConcurrentDictionary<int, ImageSource>[] CreateIndexBitmapCaches()
+    {
+        var caches = new ConcurrentDictionary<int, ImageSource>[SizeClassCount];
+        for (int i = 0; i < caches.Length; i++) caches[i] = new ConcurrentDictionary<int, ImageSource>();
+        return caches;
+    }
 
     private const int BatchSize = 128;
 
-    // Delays before asking the shell again about files it had no icon for.
+    // =========================================================================
+    // Delays before asking the shell again about a file it could not answer yet.
     //
-    // A file written a moment ago often has no icon yet: the icon handler has not
-    // been loaded, and on a large executable Defender is still scanning it — the
-    // shell simply waits. Explorer and Total Commander show the same lag, so the
-    // answer is to ask again rather than to try to outsmart the scanner.
-    //
-    // The last delay is deliberately generous: a self-extracting archive of
-    // several hundred megabytes takes seconds to clear.
+    // A file written a moment ago often has no icon: the icon handler has not
+    // been loaded, and on a large executable Defender is still scanning it.
+    // With index lookups the shell usually answers with the GENERIC index for
+    // the extension instead of failing, so a generic answer for a per-file type
+    // is shown immediately but not remembered, and asked again later. After the
+    // last retry it is accepted: plenty of executables really have no icon.
+    // =========================================================================
     private static readonly int[] RetryDelaysMs = { 1200, 3500, 8000 };
 
     // =========================================================================
-    // ONE QUEUE, ONE CONSUMER
+    // ONE QUEUE, TWO CONSUMERS
     //
-    // QueueLoad used to start a thread per call. That is fine for navigation —
-    // two calls, one per pane — but the directory watcher calls it once per
-    // created file, so moving a folder with hundreds of files spawned hundreds
-    // of threads at once. Under that thrashing the shell calls stopped
-    // producing anything, which is why moved executables kept the placeholder
-    // icon while a restart, with only two calls, resolved them fine.
-    //
-    // Work now goes through a queue drained by a single ThreadPool task. The
-    // pool is MTA, which is what this code always used and what SHGetFileInfo
-    // handles: an STA worker would have to pump messages, and one that simply
-    // blocks on a queue can deadlock in-process shell handlers.
+    // The watcher calls QueueLoad once per created file, so a thread per call
+    // turned a folder move into hundreds of threads. Work goes through one queue
+    // drained by at most two ThreadPool tasks: two, because a shell call on an
+    // executable that Defender is scanning blocks for seconds and must not stall
+    // everything queued behind it. The pool is MTA, which SHGetFileInfo handles;
+    // an STA worker would have to pump messages.
     // =========================================================================
     private sealed class IconJob
     {
@@ -101,16 +142,17 @@ public static class IconService
         public required Func<int> CurrentRequestId { get; init; }
         public required Dispatcher Dispatcher { get; init; }
         public required int Attempt { get; init; }
+        public required int SizeClass { get; init; }
     }
 
     private static readonly ConcurrentQueue<IconJob> s_queue = new();
 
-    // Two consumers, not one. A single one was enough to stop the thread storm,
-    // but SHGetFileInfo on a large executable that Defender is scanning blocks
-    // for seconds, and everything queued behind it waited too. Two keeps one slow
-    // file from stalling the rest while staying nowhere near a storm.
     private const int MaxWorkers = 2;
     private static int s_workers;
+
+    // =========================================================================
+    // PUBLIC API (unchanged signatures)
+    // =========================================================================
 
     public static void QueueLoad(
         IReadOnlyList<FileEntry> items,
@@ -121,19 +163,16 @@ public static class IconService
     {
         if (!Enabled || items.Count == 0) return;
 
-        // =====================================================================
-        // FIX: ICON FLICKER ON REFRESH
-        // Anything already in the cache is applied right here, synchronously,
-        // before the list is rendered. Going through a worker + BeginInvoke for
-        // known icons meant every refresh drew a frame with no icons at all,
-        // which looked like the whole pane blinking - very visible while a copy
-        // keeps triggering refreshes of the destination pane.
-        // =====================================================================
+        int sizeClass = CurrentSizeClass();
+
+        // Anything already known is applied right here, synchronously, before the
+        // list is rendered. Going through a worker for known icons drew a frame
+        // with no icons at all, which looked like the pane blinking on refresh.
         List<FileEntry>? uncached = null;
 
         foreach (var entry in items)
         {
-            if (!TryApplyCachedIcon(entry, virtualEntries))
+            if (!TryApplyCachedIcon(entry, virtualEntries, sizeClass))
                 (uncached ??= new List<FileEntry>()).Add(entry);
         }
 
@@ -146,9 +185,96 @@ public static class IconService
             RequestId = requestId,
             CurrentRequestId = currentRequestId,
             Dispatcher = dispatcher,
-            Attempt = 0
+            Attempt = 0,
+            SizeClass = sizeClass
         });
     }
+
+    /// <summary>Drops every cached icon, so the next listing asks the shell again.</summary>
+    public static void Clear()
+    {
+        s_extIndex.Clear();
+        s_fileIndex.Clear();
+        foreach (var cache in s_indexBitmaps) cache.Clear();
+
+        while (s_fileOrder.TryDequeue(out _)) { }
+
+        Volatile.Write(ref s_fileIndexCount, 0);
+    }
+
+    // =========================================================================
+    // SIZE SELECTION (UI thread)
+    //
+    // The pane draws icons at AppFileIconSize device-independent pixels, which
+    // ZoomManager rescales. Multiplied by the DPI scale this is the number of
+    // physical pixels needed. The small system list is used whenever it is big
+    // enough; downscaling a 32 px icon to 16 px with LowQuality scaling is what
+    // made icons look blurry, and it cost four times the memory.
+    // =========================================================================
+    private static readonly int s_smallIconPx = Math.Max(16, GetSystemMetrics(SM_CXSMICON));
+
+    private static int CurrentSizeClass()
+    {
+        double logical = 16;
+        double scale = 1.0;
+
+        var app = Application.Current;
+        if (app != null)
+        {
+            if (app.TryFindResource("AppFileIconSize") is double size && size > 0)
+                logical = size;
+
+            if (app.MainWindow is Visual main)
+            {
+                try { scale = VisualTreeHelper.GetDpi(main).DpiScaleX; }
+                catch { }
+            }
+        }
+
+        return logical * scale <= s_smallIconPx + 0.5 ? SizeSmall : SizeLarge;
+    }
+
+    // =========================================================================
+    // UI THREAD FAST PATH
+    //
+    // Returns true when the entry needs no background work: it already has an
+    // icon, it is drawn by XAML as a vector, or the caches already have the
+    // answer. Pure dictionary lookups, no shell calls.
+    // =========================================================================
+    private static bool TryApplyCachedIcon(FileEntry entry, bool virtualEntries, int sizeClass)
+    {
+        if (entry.Icon != null) return true;
+        if (IsVectorDrawn(entry)) return true;
+
+        int index;
+
+        if (!virtualEntries && NeedsPerFileLookup(entry.Name))
+        {
+            if (!s_fileIndex.TryGetValue(FileIdentityKey(entry), out index)) return false;
+        }
+        else
+        {
+            if (!s_extIndexBySpan.TryGetValue(ExtensionSpan(entry.Name), out index)) return false;
+            if (index == NoIcon) return true;
+        }
+
+        if (!s_indexBitmaps[sizeClass].TryGetValue(index, out var bitmap)) return false;
+
+        entry.Icon = bitmap;
+        return true;
+    }
+
+    // Folders, archives, ".." and custom network items are vectors in XAML.
+    // Asking Windows for their icons would waste both time and memory.
+    private static bool IsVectorDrawn(FileEntry entry) =>
+        entry.Name == ".." ||
+        (!string.IsNullOrEmpty(entry.IconType) && entry.IconType != "Default") ||
+        entry.IsFolder ||
+        entry.IsArchive;
+
+    // =========================================================================
+    // WORKERS
+    // =========================================================================
 
     private static void Enqueue(IconJob job)
     {
@@ -190,47 +316,54 @@ public static class IconService
     private static void Process(IconJob job)
     {
         var pending = new List<KeyValuePair<FileEntry, ImageSource>>(BatchSize);
-        List<FileEntry>? missed = null;
+        List<FileEntry>? retry = null;
 
         foreach (var entry in job.Items)
         {
             if (job.CurrentRequestId() != job.RequestId) return;
 
-            ImageSource? icon = Resolve(entry, job.VirtualEntries);
+            var (icon, askAgain) = Resolve(entry, job);
 
-            if (icon == null)
-            {
-                // Only per-file icons are worth asking about again; an extension
-                // with no icon will not grow one in a second and a half
-                if (job.Attempt < RetryDelaysMs.Length && NeedsPerFileIcon(entry, job.VirtualEntries))
-                    (missed ??= new List<FileEntry>()).Add(entry);
+            if (askAgain) (retry ??= new List<FileEntry>()).Add(entry);
 
-                continue;
-            }
+            if (icon == null) continue;
 
             pending.Add(new(entry, icon));
-            if (pending.Count >= BatchSize)
-                Flush(pending, job);
+            if (pending.Count >= BatchSize) Flush(pending, job);
         }
 
-        if (pending.Count > 0)
-            Flush(pending, job);
+        if (pending.Count > 0) Flush(pending, job);
 
-        if (missed != null) ScheduleRetry(job, missed);
+        if (retry != null) ScheduleRetry(job, retry);
     }
 
-    // The shell is asked once more a moment later. Without this a file that was
-    // just written keeps the placeholder until something else causes a reload.
-    private static void ScheduleRetry(IconJob job, List<FileEntry> missed)
+    private static void Flush(List<KeyValuePair<FileEntry, ImageSource>> batch, IconJob job)
+    {
+        var snapshot = batch.ToArray();
+        batch.Clear();
+
+        job.Dispatcher.BeginInvoke(new Action(() =>
+        {
+            if (job.CurrentRequestId() != job.RequestId) return;
+
+            // A retry may replace the generic icon shown earlier; ReferenceEquals
+            // in FileEntry.Icon keeps an unchanged bitmap from notifying again
+            foreach (var pair in snapshot)
+                pair.Key.Icon = pair.Value;
+        }), DispatcherPriority.Background);
+    }
+
+    private static void ScheduleRetry(IconJob job, List<FileEntry> entries)
     {
         var retry = new IconJob
         {
-            Items = missed,
+            Items = entries,
             VirtualEntries = job.VirtualEntries,
             RequestId = job.RequestId,
             CurrentRequestId = job.CurrentRequestId,
             Dispatcher = job.Dispatcher,
-            Attempt = job.Attempt + 1
+            Attempt = job.Attempt + 1,
+            SizeClass = job.SizeClass
         };
 
         int delay = RetryDelaysMs[job.Attempt];
@@ -243,189 +376,190 @@ public static class IconService
         }, null, delay, Timeout.Infinite);
     }
 
-    private static bool NeedsPerFileIcon(FileEntry entry, bool virtualEntries)
+    // =========================================================================
+    // RESOLUTION (worker threads)
+    // =========================================================================
+
+    private static (ImageSource? Icon, bool AskAgain) Resolve(FileEntry entry, IconJob job)
     {
-        if (virtualEntries || entry.IsFolder || entry.IsArchive) return false;
-        return NeedsPerFileLookup(entry.Name);
+        if (IsVectorDrawn(entry)) return (null, false);
+
+        if (!job.VirtualEntries && NeedsPerFileLookup(entry.Name))
+            return ResolvePerFile(entry, job);
+
+        // By extension. No File.Exists guard anywhere: the entry came out of a
+        // directory listing, and on a network share that check is a round trip.
+        int index = GetExtensionIndex(entry.Name);
+        if (index == NoIcon) return (null, false);
+
+        return (GetBitmap(index, job.SizeClass, ProbeName(entry.Name), byAttributes: true), false);
+    }
+
+    private static (ImageSource? Icon, bool AskAgain) ResolvePerFile(FileEntry entry, IconJob job)
+    {
+        var key = FileIdentityKey(entry);
+
+        if (s_fileIndex.TryGetValue(key, out int known))
+            return (GetBitmap(known, job.SizeClass, entry.FullPath, byAttributes: false), false);
+
+        bool canRetry = job.Attempt < RetryDelaysMs.Length;
+        int genericIndex = GetExtensionIndex(entry.Name);
+        int index = QueryIndex(entry.FullPath, byAttributes: false);
+
+        if (index == NoIcon)
+        {
+            // The shell could not answer at all (file gone, handler not loaded).
+            // Show the generic icon for now; a failure is never remembered.
+            var generic = genericIndex == NoIcon
+                ? null
+                : GetBitmap(genericIndex, job.SizeClass, ProbeName(entry.Name), byAttributes: true);
+
+            return (generic, canRetry);
+        }
+
+        // A generic answer for a type that normally carries its own icon may
+        // mean "not ready yet". Show it, do not remember it, ask again later.
+        if (index == genericIndex && canRetry)
+            return (GetBitmap(index, job.SizeClass, entry.FullPath, byAttributes: false), true);
+
+        RememberFileIndex(key, index);
+        return (GetBitmap(index, job.SizeClass, entry.FullPath, byAttributes: false), false);
+    }
+
+    private static int GetExtensionIndex(string name)
+    {
+        var ext = ExtensionSpan(name);
+        if (s_extIndexBySpan.TryGetValue(ext, out int cached)) return cached;
+
+        int index = QueryIndex(ProbeName(name), byAttributes: true);
+        s_extIndex.TryAdd(ext.ToString(), index);
+        return index;
+    }
+
+    // One bitmap per distinct icon and size. The pixels are taken from the file
+    // (or extension) that produced the index, which is the same icon the system
+    // image list holds for it.
+    private static ImageSource? GetBitmap(int index, int sizeClass, string source, bool byAttributes)
+    {
+        var cache = s_indexBitmaps[sizeClass];
+        if (cache.TryGetValue(index, out var cached)) return cached;
+
+        var loaded = LoadIconBitmap(source, byAttributes, sizeClass);
+        if (loaded == null) return null;
+
+        // Two workers may race on the same index; both get the stored instance
+        return cache.GetOrAdd(index, loaded);
+    }
+
+    private static void RememberFileIndex(IconKey key, int index)
+    {
+        if (!s_fileIndex.TryAdd(key, index)) return;
+
+        s_fileOrder.Enqueue(key);
+        if (Interlocked.Increment(ref s_fileIndexCount) > FileIndexLimit) TrimFileIndex();
+    }
+
+    // Evicts the oldest quarter rather than clearing everything: a full wipe
+    // dropped the entries of the folder on screen along with the rest.
+    private static void TrimFileIndex()
+    {
+        int toEvict = FileIndexLimit / 4;
+
+        for (int i = 0; i < toEvict && s_fileOrder.TryDequeue(out var old); i++)
+        {
+            if (s_fileIndex.TryRemove(old, out _)) Interlocked.Decrement(ref s_fileIndexCount);
+        }
     }
 
     // =========================================================================
-    // Per-file icons are keyed by name, size and timestamp — deliberately NOT by
-    // path.
-    //
-    // A move changes only the path: name, size and stamp survive it, so the icon
-    // loaded while the file was still in the source folder is a hit the moment it
-    // appears in the destination. Keying by path instead threw that away and left
-    // the user watching the shell load the vendor's icon handler from scratch.
-    //
-    // The stamp keeps the key honest in the other direction: drop a different
-    // build over an old file and the size or the timestamp differs, so it misses
-    // the cache rather than showing the previous icon. A collision needs two
-    // files with the same name, the same byte count and the same timestamp to the
-    // tick — at which point they are the same file anyway.
+    // NAME HELPERS
     // =========================================================================
-    private static IconKey FileIdentityKey(FileEntry entry) =>
-        new(entry.Name, entry.Modified?.Ticks ?? 0, entry.Size);
 
-    // Returns true when the entry needs no background work: it already has an
-    // icon, it is drawn by XAML as a vector, or the cache already has an answer.
-    // Pure dictionary lookups, no shell calls, so this is safe on the UI thread.
-    private static bool TryApplyCachedIcon(FileEntry entry, bool virtualEntries)
+    private static bool NeedsPerFileLookup(string name)
     {
-        if (entry.Icon != null) return true;
+        int dot = name.LastIndexOf('.');
+        if (dot < 0) return false;
 
-        if (entry.Name == "..") return true;
-        if (!string.IsNullOrEmpty(entry.IconType) && entry.IconType != "Default") return true;
-        if (entry.IsFolder || entry.IsArchive) return true;
+        var ext = name.AsSpan(dot);
 
-        if (!virtualEntries && NeedsPerFileLookup(entry.Name))
+        foreach (string candidate in s_perFileExtensions)
         {
-            if (s_fileCache.TryGetValue(FileIdentityKey(entry), out var byFile) && byFile != null)
-            {
-                entry.Icon = byFile;
-                return true;
-            }
-            return false;
-        }
-
-        if (s_extCache.TryGetValue(ExtensionKey(entry.Name), out var byExt))
-        {
-            if (byExt != null) entry.Icon = byExt;
-            return true;
+            if (ext.Equals(candidate, StringComparison.OrdinalIgnoreCase)) return true;
         }
 
         return false;
     }
 
-    private static void Flush(List<KeyValuePair<FileEntry, ImageSource>> batch, IconJob job)
+    private static ReadOnlySpan<char> ExtensionSpan(string name)
     {
-        var snapshot = batch.ToArray();
-        batch.Clear();
-
-        job.Dispatcher.BeginInvoke(new Action(() =>
-        {
-            if (job.CurrentRequestId() != job.RequestId) return;
-
-            foreach (var pair in snapshot)
-                pair.Key.Icon = pair.Value;
-        }), DispatcherPriority.Background);
+        int dot = name.LastIndexOf('.');
+        return dot < 0 || dot == name.Length - 1 ? NoExtKey.AsSpan() : name.AsSpan(dot);
     }
 
-    private static ImageSource? Resolve(FileEntry entry, bool virtualEntries)
+    // With SHGFI_USEFILEATTRIBUTES the shell only looks at the extension. A short
+    // synthetic name avoids handing it an arbitrary long or odd real one.
+    private static string ProbeName(string name)
     {
-        // 1. Custom elements and navigation (they don't need Windows icons)
-        if (entry.Name == "..")
-            return null;
-
-        if (!string.IsNullOrEmpty(entry.IconType) && entry.IconType != "Default")
-            return null;
-
-        // 2. Folders and archives are always vector in XAML. Asking Windows for
-        // their icons would waste both time and memory.
-        if (entry.IsFolder || entry.IsArchive)
-            return null;
-
-        // 3. Regular files
-        //
-        // No File.Exists guard: the entry came out of a directory listing, so the
-        // check was an extra round trip per executable — painful on a network
-        // share — and SHGetFileInfo answers with zero for a file that has gone.
-        if (!virtualEntries && NeedsPerFileLookup(entry.Name))
-        {
-            // A miss here means the shell was not ready, not that the file has
-            // no icon. Remembering it would freeze the placeholder in place for
-            // the rest of the session.
-            return GetOrAddFileIcon(FileIdentityKey(entry), () => LoadFromPath(entry.FullPath));
-        }
-
-        string key = ExtensionKey(entry.Name);
-
-        // By extension the answer is deterministic — SHGFI_USEFILEATTRIBUTES does
-        // not touch the file at all — so a miss is worth remembering
-        if (s_extCache.TryGetValue(key, out var cachedByExt)) return cachedByExt;
-
-        ImageSource? byExtension = LoadByAttributes(entry.Name, directory: false);
-        s_extCache[key] = byExtension;
-        return byExtension;
+        var ext = ExtensionSpan(name);
+        return ext.SequenceEqual(NoExtKey.AsSpan()) ? "file" : string.Concat("file", ext);
     }
 
-    private static ImageSource? GetOrAddFileIcon(IconKey key, Func<ImageSource?> loader)
-    {
-        if (s_fileCache.TryGetValue(key, out var cached)) return cached;
-
-        ImageSource? icon = loader();
-        if (icon == null) return null;      // failures are never remembered
-
-        if (s_fileCache.TryAdd(key, icon))
-        {
-            s_fileOrder.Enqueue(key);
-
-            if (Interlocked.Increment(ref s_fileCacheCount) > FileCacheLimit) TrimFileCache();
-        }
-
-        return icon;
-    }
+    private static IconKey FileIdentityKey(FileEntry entry) =>
+        new(entry.Name, entry.Modified?.Ticks ?? 0, entry.Size);
 
     // =========================================================================
-    // Evicts the oldest quarter rather than clearing everything.
+    // WIN32
     //
-    // A full wipe at the limit dropped the icons of the folder currently on
-    // screen along with the rest, so crossing the threshold showed up as every
-    // visible icon reloading at once — the exact stutter this cache exists to
-    // avoid.
+    // LibraryImport with a blittable struct: the old DllImport marshalled two
+    // ByValTStr strings (display name and type name) on every single call only
+    // to throw them away.
     // =========================================================================
-    private static void TrimFileCache()
-    {
-        int toEvict = FileCacheLimit / 4;
 
-        for (int i = 0; i < toEvict && s_fileOrder.TryDequeue(out var old); i++)
+    private static readonly uint s_infoSize = (uint)Unsafe.SizeOf<SHFILEINFOW>();
+
+    // Returns the index of the icon in the system image list, or NoIcon.
+    // The HIMAGELIST returned here belongs to the shell and must not be freed.
+    private static int QueryIndex(string path, bool byAttributes)
+    {
+        var info = default(SHFILEINFOW);
+
+        uint flags = SHGFI_SYSICONINDEX | SHGFI_SMALLICON;
+        uint attributes = 0;
+
+        if (byAttributes)
         {
-            if (s_fileCache.TryRemove(old, out _)) Interlocked.Decrement(ref s_fileCacheCount);
+            flags |= SHGFI_USEFILEATTRIBUTES;
+            attributes = FILE_ATTRIBUTE_NORMAL;
         }
+
+        IntPtr imageList = SHGetFileInfo(path, attributes, ref info, s_infoSize, flags);
+        return imageList == IntPtr.Zero ? NoIcon : info.iIcon;
     }
 
-    /// <summary>Drops every cached icon, so the next listing asks the shell again.</summary>
-    public static void Clear()
+    private static ImageSource? LoadIconBitmap(string path, bool byAttributes, int sizeClass)
     {
-        s_extCache.Clear();
-        s_fileCache.Clear();
+        var info = default(SHFILEINFOW);
 
-        while (s_fileOrder.TryDequeue(out _)) { }
+        uint flags = SHGFI_ICON | (sizeClass == SizeSmall ? SHGFI_SMALLICON : SHGFI_LARGEICON);
+        uint attributes = 0;
 
-        Volatile.Write(ref s_fileCacheCount, 0);
-    }
+        if (byAttributes)
+        {
+            flags |= SHGFI_USEFILEATTRIBUTES;
+            attributes = FILE_ATTRIBUTE_NORMAL;
+        }
 
-    // --- Win32 ---------------------------------------------------------------
+        IntPtr result = SHGetFileInfo(path, attributes, ref info, s_infoSize, flags);
+        if (result == IntPtr.Zero || info.hIcon == IntPtr.Zero) return null;
 
-    // Marshal.SizeOf walks the layout every time it is called, and it was called
-    // once per icon
-    private static readonly uint s_shfiSize = (uint)Marshal.SizeOf<SHFILEINFO>();
-
-    private static ImageSource? LoadFromPath(string path)
-    {
-        var shfi = new SHFILEINFO();
-        IntPtr res = SHGetFileInfo(path, 0, ref shfi, s_shfiSize, SHGFI_ICON | SHGFI_LARGEICON);
-        return FromShfi(res, ref shfi);
-    }
-
-    private static ImageSource? LoadByAttributes(string name, bool directory)
-    {
-        uint attr = directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
-        var shfi = new SHFILEINFO();
-        IntPtr res = SHGetFileInfo(name, attr, ref shfi, s_shfiSize,
-            SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES);
-        return FromShfi(res, ref shfi);
-    }
-
-    private static ImageSource? FromShfi(IntPtr res, ref SHFILEINFO shfi)
-    {
-        if (res == IntPtr.Zero || shfi.hIcon == IntPtr.Zero) return null;
         try
         {
-            var src = Imaging.CreateBitmapSourceFromHIcon(
-                shfi.hIcon, System.Windows.Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
-            src.Freeze();
-            return src;
+            var bitmap = Imaging.CreateBitmapSourceFromHIcon(
+                info.hIcon, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+
+            // Frozen: shareable across threads and rows, no change tracking
+            bitmap.Freeze();
+            return bitmap;
         }
         catch
         {
@@ -433,33 +567,36 @@ public static class IconService
         }
         finally
         {
-            DestroyIcon(shfi.hIcon);
+            DestroyIcon(info.hIcon);
         }
     }
 
     private const uint SHGFI_ICON = 0x000000100;
+    private const uint SHGFI_SYSICONINDEX = 0x000004000;
     private const uint SHGFI_LARGEICON = 0x000000000;
+    private const uint SHGFI_SMALLICON = 0x000000001;
     private const uint SHGFI_USEFILEATTRIBUTES = 0x000000010;
     private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
-    private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+    private const int SM_CXSMICON = 49;
 
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
-    private struct SHFILEINFO
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private unsafe struct SHFILEINFOW
     {
         public IntPtr hIcon;
         public int iIcon;
         public uint dwAttributes;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
-        public string szDisplayName;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)]
-        public string szTypeName;
+        public fixed char szDisplayName[260];
+        public fixed char szTypeName[80];
     }
 
-    [DllImport("shell32.dll", CharSet = CharSet.Auto)]
-    private static extern IntPtr SHGetFileInfo(
-        string pszPath, uint dwFileAttributes, ref SHFILEINFO psfi, uint cbFileInfo, uint uFlags);
+    [LibraryImport("shell32.dll", EntryPoint = "SHGetFileInfoW", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial IntPtr SHGetFileInfo(
+        string pszPath, uint dwFileAttributes, ref SHFILEINFOW psfi, uint cbFileInfo, uint uFlags);
 
-    [DllImport("user32.dll", SetLastError = true)]
+    [LibraryImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool DestroyIcon(IntPtr hIcon);
+    private static partial bool DestroyIcon(IntPtr hIcon);
+
+    [LibraryImport("user32.dll")]
+    private static partial int GetSystemMetrics(int nIndex);
 }
