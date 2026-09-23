@@ -7,6 +7,9 @@ namespace R2Cmd
     {
         public static bool IsDarkTheme { get; private set; } = true;
 
+        // Add an event that controls can listen to
+        public static event EventHandler? ThemeChanged;
+
         public static void ApplyTheme(bool isDark)
         {
             IsDarkTheme = isDark;
@@ -17,6 +20,9 @@ namespace R2Cmd
 
             // Replaces the palette dictionary at Index 0 without touching styles at Index 1
             Application.Current.Resources.MergedDictionaries[0] = dict;
+
+            // Notify custom controls like the Terminal that the dictionary changed
+            ThemeChanged?.Invoke(null, EventArgs.Empty);
         }
 
         public static void ToggleTheme()

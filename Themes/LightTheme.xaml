@@ -42,23 +42,23 @@
     <Color x:Key="Color.Terminal.Cursor">#FF6B7280</Color>
 
     <!-- Standard xterm-256color palette (first 16 colors) -->
-    <!-- This matches what Ubuntu/Linux terminals expect for proper mc colors -->
+    <!-- Adapted for LIGHT background: bright colors are darkened to ensure contrast -->
     <Color x:Key="Color.Terminal.Ansi0">#FF000000</Color>
-    <Color x:Key="Color.Terminal.Ansi1">#FFCD0000</Color>
-    <Color x:Key="Color.Terminal.Ansi2">#FF00CD00</Color>
-    <Color x:Key="Color.Terminal.Ansi3">#FFCDCD00</Color>
-    <Color x:Key="Color.Terminal.Ansi4">#FF0000EE</Color>
-    <Color x:Key="Color.Terminal.Ansi5">#FFCD00CD</Color>
-    <Color x:Key="Color.Terminal.Ansi6">#FF00CDCD</Color>
-    <Color x:Key="Color.Terminal.Ansi7">#FFE5E5E5</Color>
-    <Color x:Key="Color.Terminal.Ansi8">#FF7F7F7F</Color>
-    <Color x:Key="Color.Terminal.Ansi9">#FFFF0000</Color>
-    <Color x:Key="Color.Terminal.Ansi10">#FF00FF00</Color>
-    <Color x:Key="Color.Terminal.Ansi11">#FFFFFF00</Color>
-    <Color x:Key="Color.Terminal.Ansi12">#FF5C5CFF</Color>
-    <Color x:Key="Color.Terminal.Ansi13">#FFFF00FF</Color>
-    <Color x:Key="Color.Terminal.Ansi14">#FF00FFFF</Color>
-    <Color x:Key="Color.Terminal.Ansi15">#FFFFFFFF</Color>
+    <Color x:Key="Color.Terminal.Ansi1">#FFC01B1B</Color>
+    <Color x:Key="Color.Terminal.Ansi2">#FF1A7F37</Color>
+    <Color x:Key="Color.Terminal.Ansi3">#FF9A6700</Color>
+    <Color x:Key="Color.Terminal.Ansi4">#FF055C9A</Color>
+    <Color x:Key="Color.Terminal.Ansi5">#FFC01B5D</Color>
+    <Color x:Key="Color.Terminal.Ansi6">#FF007777</Color>
+    <Color x:Key="Color.Terminal.Ansi7">#FF333333</Color>
+    <Color x:Key="Color.Terminal.Ansi8">#FF666666</Color>
+    <Color x:Key="Color.Terminal.Ansi9">#FFD32F2F</Color>
+    <Color x:Key="Color.Terminal.Ansi10">#FF2E7D32</Color>
+    <Color x:Key="Color.Terminal.Ansi11">#FFB8860B</Color>
+    <Color x:Key="Color.Terminal.Ansi12">#FF1565C0</Color>
+    <Color x:Key="Color.Terminal.Ansi13">#FFC2185B</Color>
+    <Color x:Key="Color.Terminal.Ansi14">#FF00838F</Color>
+    <Color x:Key="Color.Terminal.Ansi15">#FF000000</Color>
 
     <!-- Dynamic Brush Mapping -->
     <SolidColorBrush x:Key="Brush.Background" Color="{DynamicResource Color.Background}" />

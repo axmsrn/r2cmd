@@ -51,6 +51,10 @@ public partial class SearchWindow : Window
 
     // Limits
     private const int MaxResults = 50_000;
+
+    // Four readers: enough to keep an SSD busy, few enough that a spinning disk
+    // is not thrown into constant seeking between files
+    private static readonly int ContentSearchThreads = Math.Clamp(Environment.ProcessorCount, 2, 4);
     private const int BatchSize = 256;
     private const long MaxArchiveContentSize = 16L * 1024 * 1024;
     private const int BatchIntervalMs = 100;
@@ -452,7 +456,7 @@ public partial class SearchWindow : Window
             }
         }
 
-        void Flush()
+        void Flush(bool waitForUi = false)
         {
             if (batch.Count == 0) return;
 
@@ -460,7 +464,7 @@ public partial class SearchWindow : Window
             batch.Clear();
             sinceFlush.Restart();
 
-            Dispatcher.Invoke(() =>
+            void AddChunk()
             {
                 bool wasEmpty = _results.Count == 0;
                 foreach (var item in chunk)
@@ -470,7 +474,12 @@ public partial class SearchWindow : Window
                     FocusFirstResult();
 
                 UpdateStatsUI();
-            }, DispatcherPriority.Background);
+            }
+
+            if (waitForUi)
+                Dispatcher.Invoke(AddChunk, DispatcherPriority.Background);
+            else
+                Dispatcher.InvokeAsync(AddChunk, DispatcherPriority.Background);
         }
 
         bool Add(FileEntry item)
@@ -559,60 +568,122 @@ public partial class SearchWindow : Window
                     Size = entry.IsDirectory ? 0 : entry.Length,
                     Modified = entry.LastWriteTimeUtc.LocalDateTime
                 },
-                options);
-
-            try
+                options)
             {
-                foreach (var item in enumerable)
+                ShouldRecursePredicate = static (ref FileSystemEntry e) =>
+                    (e.Attributes & FileAttributes.ReparsePoint) == 0,
+                ShouldIncludePredicate = (ref FileSystemEntry e) =>
                 {
-                    token.ThrowIfCancellationRequested();
+                    if (e.IsDirectory) Interlocked.Increment(ref scannedFolders);
+                    else Interlocked.Increment(ref scannedFiles);
 
-                    if (item.IsFolder)
-                        scannedFolders++;
-                    else
-                        scannedFiles++;
+                    if (searchArchives && !e.IsDirectory &&
+                        ArchiveService.IsArchiveFile(e.ToFullPath()))
+                        return true;
 
-                    // Archives only on local
-                    if (searchArchives && !item.IsFolder && ArchiveService.IsArchiveFile(item.FullPath))
+                    return NameMatches(e.FileName.ToString());
+                }
+            };
+
+            // Guards the result batch and the limit flag once several threads add
+            var sync = new object();
+
+            // false: the result limit was reached
+            bool HandleItem(FileEntry item)
+            {
+                token.ThrowIfCancellationRequested();
+
+                if (searchArchives && !item.IsFolder && ArchiveService.IsArchiveFile(item.FullPath))
+                {
+                    var inner = SearchArchive(item.FullPath, NameMatches, textQuery, token,
+                        count => Interlocked.Add(ref totalTextMatches, count));
+
+                    lock (sync)
                     {
-                        foreach (var inner in SearchArchive(item.FullPath, NameMatches, textQuery, token,
-                                 count => totalTextMatches += count))
+                        foreach (var hit in inner)
                         {
                             scannedFiles++;
-                            if (!Add(inner))
+                            if (hitLimit || !Add(hit))
                             {
                                 hitLimit = true;
                                 return false;
                             }
                         }
                     }
+                }
 
-                    if (!NameMatches(item.Name))
-                        continue;
+                if (!NameMatches(item.Name))
+                    return true;
 
-                    if (textQuery != null)
-                    {
-                        if (item.IsFolder) continue;
+                if (textQuery != null)
+                {
+                    if (item.IsFolder) return true;
 
-                        int matchCount = TextSearcher.CountMatchesInFile(item.FullPath, textQuery, token);
-                        if (matchCount == 0) continue;
+                    // The expensive part, outside the lock: this is what runs in parallel
+                    int matchCount = TextSearcher.CountMatchesInFile(item.FullPath, textQuery, token);
+                    if (matchCount == 0) return true;
 
-                        totalTextMatches += matchCount;
-                    }
+                    Interlocked.Add(ref totalTextMatches, matchCount);
+                }
 
-                    if (!Add(item))
+                lock (sync)
+                {
+                    if (hitLimit || !Add(item))
                     {
                         hitLimit = true;
                         return false;
                     }
                 }
+
+                return true;
+            }
+
+            try
+            {
+                if (textQuery == null)
+                {
+                    // Name search is bound by the directory walk itself; threads
+                    // would only wait on each other
+                    foreach (var item in enumerable)
+                    {
+                        if (!HandleItem(item)) return false;
+                    }
+                }
+                else
+                {
+                    // =========================================================
+                    // Content search reads and scans every candidate file, and
+                    // that is where the time goes. The walk still runs on one
+                    // thread (Parallel.ForEach pulls from the enumerator under
+                    // its own lock); the file reading spreads over a few.
+                    // Results arrive in completion order, not walk order; the
+                    // list can be sorted by any column afterwards.
+                    // =========================================================
+                    var parallelOptions = new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = ContentSearchThreads,
+                        CancellationToken = token
+                    };
+
+                    Parallel.ForEach(enumerable, parallelOptions, (item, state) =>
+                    {
+                        if (!HandleItem(item)) state.Stop();
+                    });
+
+                    if (hitLimit) return false;
+                }
             }
             catch (OperationCanceledException) { throw; }
+
+            // A cancellation observed inside a worker arrives wrapped
+            catch (AggregateException) when (token.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(token);
+            }
             catch { /* inaccessible path – skip */ }
 
             return true;
         }
-
         // ------------------------------------------------------------------
         // Fast remote search using the server-side `find` / `rg` commands
         // ------------------------------------------------------------------
@@ -806,7 +877,7 @@ public partial class SearchWindow : Window
         finally
         {
             // Always flush remaining items
-            Flush();
+            Flush(waitForUi: true);
             searchDuration.Stop();
             Dispatcher.Invoke(UpdateStatsUI, DispatcherPriority.Background);
         }

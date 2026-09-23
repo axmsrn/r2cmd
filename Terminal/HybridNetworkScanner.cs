@@ -12,22 +12,23 @@ using System.Threading.Tasks;
 
 namespace R2Cmd.Providers;
 
-public static class HybridNetworkScanner
+// Class must be partial to support [LibraryImport] source generation
+public static partial class HybridNetworkScanner
 {
-    private static List<string>? _cachedComputers;
-    private static DateTime _lastScanTime = DateTime.MinValue;
-    private static readonly TimeSpan CacheTtl = TimeSpan.FromSeconds(300); // 5 minutes cache
-
     // --- PROMISE CACHING ---
-    private static Task<List<string>>? _activeScanTask;
-    private static readonly object _syncRoot = new();
+    private static Task<List<string>>? _cachedTask;
+    private static DateTime _cacheExpiration = DateTime.MinValue;
+
+    // Use .NET 10 hardware-optimized lock
+    private static readonly System.Threading.Lock _syncRoot = new();
+    private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(5);
 
     public static void InvalidateCache()
     {
         lock (_syncRoot)
         {
-            _lastScanTime = DateTime.MinValue;
-            _cachedComputers = null;
+            _cacheExpiration = DateTime.MinValue;
+            _cachedTask = null;
         }
     }
 
@@ -36,37 +37,22 @@ public static class HybridNetworkScanner
 
     public static async Task<List<string>> ScanNetworkAsync(bool forceRefresh, CancellationToken token = default)
     {
-        Task<List<string>> scanTaskToAwait;
+        Task<List<string>> scanTask;
 
         lock (_syncRoot)
         {
-            if (forceRefresh)
+            if (forceRefresh || _cachedTask == null || DateTime.UtcNow > _cacheExpiration)
             {
-                _lastScanTime = DateTime.MinValue;
-                _cachedComputers = null;
+                // The task runs in the background. We cache the promise itself, not just the result.
+                _cachedTask = PerformBackgroundScanAsync();
+                _cacheExpiration = DateTime.UtcNow.Add(CacheTtl);
             }
-
-            // If the cache is fresh, return immediately
-            if (_cachedComputers != null && (DateTime.UtcNow - _lastScanTime) < CacheTtl)
-                return _cachedComputers;
-
-            // If a scan is not running or the cache is stale, start a new one in the background
-            if (_activeScanTask == null || _activeScanTask.IsCompleted)
-            {
-                // IMPORTANT: do not pass the UI cancellation token here.
-                // This work must finish in the background and refresh the cache.
-                _activeScanTask = PerformBackgroundScanAsync();
-            }
-
-            scanTaskToAwait = _activeScanTask;
+            scanTask = _cachedTask;
         }
 
-        // Wait for the background scan to finish or for cancellation (user clicked another drive)
-        var tcs = new TaskCompletionSource<List<string>>();
-        using var reg = token.Register(() => tcs.TrySetCanceled(token));
-
-        var completedTask = await Task.WhenAny(scanTaskToAwait, tcs.Task);
-        return await completedTask; // If the user left the folder, this throws TaskCanceledException
+        // Modern UI cancellation pattern without cancelling the background work.
+        // Uses native .NET WaitAsync to avoid unnecessary TaskCompletionSource allocations.
+        return await scanTask.WaitAsync(token);
     }
 
     private static async Task<List<string>> PerformBackgroundScanAsync()
@@ -79,18 +65,10 @@ public static class HybridNetworkScanner
 
         await Task.WhenAll(taskCache, taskActive);
 
-        var result = foundHosts.Keys
+        return foundHosts.Keys
             .OrderBy(name => name.Contains('.') ? 1 : 0)
             .ThenBy(name => name)
             .ToList();
-
-        lock (_syncRoot)
-        {
-            _cachedComputers = result;
-            _lastScanTime = DateTime.UtcNow;
-        }
-
-        return result;
     }
 
     // =========================================================================
@@ -103,8 +81,8 @@ public static class HybridNetworkScanner
         public string sv100_name;
     }
 
-    [DllImport("Netapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern int NetServerEnum(
+    [LibraryImport("Netapi32.dll", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
+    private static partial int NetServerEnum(
         string? servername,
         int level,
         out IntPtr bufptr,
@@ -115,8 +93,8 @@ public static class HybridNetworkScanner
         string? domain,
         IntPtr resume_handle);
 
-    [DllImport("Netapi32.dll")]
-    private static extern int NetApiBufferFree(IntPtr buffer);
+    [LibraryImport("Netapi32.dll")]
+    private static partial int NetApiBufferFree(IntPtr buffer);
 
     private static void ScanWindowsCache(ConcurrentDictionary<string, byte> foundHosts)
     {
@@ -153,8 +131,8 @@ public static class HybridNetworkScanner
     // =========================================================================
     // Active Network Scanner (ARP for LAN / ICMP for VPN)
     // =========================================================================
-    [DllImport("iphlpapi.dll", ExactSpelling = true)]
-    private static extern int SendARP(int destIp, int srcIP, byte[] pMacAddr, ref uint phyAddrLen);
+    [LibraryImport("iphlpapi.dll")]
+    private static partial int SendARP(int destIp, int srcIP, byte[] pMacAddr, ref uint phyAddrLen);
 
     private static async Task ScanActiveSubnetsAsync(ConcurrentDictionary<string, byte> foundHosts, CancellationToken token)
     {

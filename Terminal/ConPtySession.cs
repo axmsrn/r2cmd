@@ -122,52 +122,45 @@ public sealed class ConPtySession : ITerminalSession
         cols = Math.Max(cols, 8);
         rows = Math.Max(rows, 2);
 
-        IntPtr inputRead = IntPtr.Zero, inputWrite = IntPtr.Zero;
-        IntPtr outputRead = IntPtr.Zero, outputWrite = IntPtr.Zero;
-        bool started = false;
+        if (!CreatePipe(out IntPtr inputRead, out IntPtr inputWrite, IntPtr.Zero, 0))
+            throw new IOException("CreatePipe failed for terminal input.");
+
+        if (!CreatePipe(out IntPtr outputRead, out IntPtr outputWrite, IntPtr.Zero, 0))
+        {
+            CloseHandle(inputRead);
+            CloseHandle(inputWrite);
+            throw new IOException("CreatePipe failed for terminal output.");
+        }
+
+        // Immediately wrap our ends in SafeFileHandle. GC and Dispose will handle them safely now.
+        var safeInputWrite = new SafeFileHandle(inputWrite, ownsHandle: true);
+        var safeOutputRead = new SafeFileHandle(outputRead, ownsHandle: true);
 
         try
         {
-            if (!CreatePipe(out inputRead, out inputWrite, IntPtr.Zero, 0))
-                throw new IOException("CreatePipe failed for terminal input.");
-
-            if (!CreatePipe(out outputRead, out outputWrite, IntPtr.Zero, 0))
-                throw new IOException("CreatePipe failed for terminal output.");
-
             int hr = CreatePseudoConsole(new COORD { X = (short)cols, Y = (short)rows }, inputRead, outputWrite, 0, out _hPC);
             if (hr != 0) throw new IOException($"CreatePseudoConsole failed (HRESULT 0x{hr:X8}).");
 
             StartProcess(commandLine, workingDirectory);
 
-            // The pseudo console owns its ends now; keeping ours open would prevent EOF
-            CloseHandle(inputRead); inputRead = IntPtr.Zero;
-            CloseHandle(outputWrite); outputWrite = IntPtr.Zero;
-
-            // From here the SafeFileHandles own the remaining two
-            _writeStream = new FileStream(new SafeFileHandle(inputWrite, true), FileAccess.Write, 1, false);
-            inputWrite = IntPtr.Zero;
-
-            _readStream = new FileStream(new SafeFileHandle(outputRead, true), FileAccess.Read, 4096, false);
-            outputRead = IntPtr.Zero;
+            _writeStream = new FileStream(safeInputWrite, FileAccess.Write, 1, false);
+            _readStream = new FileStream(safeOutputRead, FileAccess.Read, 4096, false);
 
             _readThread = new Thread(ReadLoop) { IsBackground = true, Name = "ConPty reader" };
             _readThread.Start();
-
-            started = true;
+        }
+        catch
+        {
+            safeInputWrite.Dispose();
+            safeOutputRead.Dispose();
+            Dispose();
+            throw;
         }
         finally
         {
-            if (!started)
-            {
-                if (inputRead != IntPtr.Zero) CloseHandle(inputRead);
-                if (inputWrite != IntPtr.Zero) CloseHandle(inputWrite);
-                if (outputRead != IntPtr.Zero) CloseHandle(outputRead);
-                if (outputWrite != IntPtr.Zero) CloseHandle(outputWrite);
-
-                // Releases the pseudo console, the attribute list and any process
-                // handles that CreateProcess managed to hand back
-                Dispose();
-            }
+            // ConPTY owns these ends now. We must close our local references to allow EOF.
+            CloseHandle(inputRead);
+            CloseHandle(outputWrite);
         }
     }
 
@@ -205,12 +198,23 @@ public sealed class ConPtySession : ITerminalSession
         var chars = new char[4096];
         var decoder = new UTF8Encoding(false).GetDecoder(); // keeps state across split sequences
 
+        // =====================================================================
+        // The pipe is read until it closes, even after Dispose has started.
+        //
+        // ClosePseudoConsole waits for the console host to flush its last
+        // output, and the host can only flush into a pipe someone is reading.
+        // The loop used to stop at the first chunk after Dispose set the flag;
+        // with more output pending, ClosePseudoConsole then waited forever and
+        // closing a terminal froze the window (Windows 10 and Windows 11 before
+        // 24H2). After Dispose the data is simply dropped.
+        // =====================================================================
         try
         {
-            while (!_disposed)
+            while (true)
             {
                 int read = _readStream!.Read(bytes, 0, bytes.Length);
                 if (read <= 0) break;
+                if (_disposed) continue;
 
                 int decoded = decoder.GetChars(bytes, 0, read, chars, 0);
                 if (decoded > 0) Output?.Invoke(chars, decoded);

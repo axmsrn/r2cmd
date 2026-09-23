@@ -1,10 +1,11 @@
 using System;
 using System.Collections.ObjectModel;
-using System.IO;
 using System.Linq;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Controls;
+using System.Windows.Documents;
+using System.Windows.Media;
 
 namespace R2Cmd;
 
@@ -15,7 +16,12 @@ public partial class FavoriteWindow : Window
     public ObservableCollection<FavoriteEntry> Items { get; } = new();
     public FavoriteEntry? SelectedResult { get; private set; }
 
-    public FavoriteWindow(AppSettings settings)
+    private Point _dragStart;
+    private FavoriteEntry? _draggedItem;
+    private int _insertIndex = -1;
+    private InsertionLineAdorner? _insertionAdorner;
+
+    public FavoriteWindow(AppSettings settings, string? currentPath = null)
     {
         InitializeComponent();
         _settings = settings;
@@ -25,8 +31,22 @@ public partial class FavoriteWindow : Window
 
         lstFavorites.ItemsSource = Items;
 
+        int idx = 0;
+        if (!string.IsNullOrEmpty(currentPath))
+        {
+            string cur = currentPath.TrimEnd('\\', '/');
+            for (int i = 0; i < Items.Count; i++)
+            {
+                if (string.Equals(Items[i].Path.TrimEnd('\\', '/'), cur, StringComparison.OrdinalIgnoreCase))
+                {
+                    idx = i;
+                    break;
+                }
+            }
+        }
+
         if (Items.Count > 0)
-            lstFavorites.SelectedIndex = 0;
+            lstFavorites.SelectedIndex = idx;
 
         Loaded += (s, e) =>
         {
@@ -76,32 +96,31 @@ public partial class FavoriteWindow : Window
             string.Equals(newPath, entry.Path, StringComparison.Ordinal))
         { lstFavorites.Focus(); return; }
 
+        if (Items.Where((_, i) => i != idx)
+                 .Any(f => string.Equals(f.Path, newPath, StringComparison.OrdinalIgnoreCase)))
+        {
+            MessageDialog.Show(this, "This directory is already in favorites.", "Info");
+            lstFavorites.Focus();
+            return;
+        }
+
         Items[idx] = new FavoriteEntry { Name = newName, Path = newPath };
         lstFavorites.SelectedIndex = idx;
         lstFavorites.Focus();
     }
 
-    private void BtnUp_Click(object sender, RoutedEventArgs e)
+    private void BtnUp_Click(object sender, RoutedEventArgs e) => MoveSelected(-1);
+
+    private void BtnDown_Click(object sender, RoutedEventArgs e) => MoveSelected(1);
+
+    private void MoveSelected(int delta)
     {
         int idx = lstFavorites.SelectedIndex;
-        if (idx <= 0) return;
+        int newIdx = idx + delta;
+        if (idx < 0 || newIdx < 0 || newIdx >= Items.Count) return;
 
-        var item = Items[idx];
-        Items.RemoveAt(idx);
-        Items.Insert(idx - 1, item);
-        lstFavorites.SelectedIndex = idx - 1;
-        lstFavorites.Focus();
-    }
-
-    private void BtnDown_Click(object sender, RoutedEventArgs e)
-    {
-        int idx = lstFavorites.SelectedIndex;
-        if (idx < 0 || idx >= Items.Count - 1) return;
-
-        var item = Items[idx];
-        Items.RemoveAt(idx);
-        Items.Insert(idx + 1, item);
-        lstFavorites.SelectedIndex = idx + 1;
+        Items.Move(idx, newIdx);
+        lstFavorites.SelectedIndex = newIdx;
         lstFavorites.Focus();
     }
 
@@ -126,6 +145,162 @@ public partial class FavoriteWindow : Window
             SelectedResult = entry;
             SaveAndClose(true);
         }
+    }
+
+    private void LstFavorites_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        _dragStart = e.GetPosition(null);
+        _draggedItem = GetEntryAt(e.GetPosition(lstFavorites));
+    }
+
+    private void LstFavorites_PreviewMouseMove(object sender, MouseEventArgs e)
+    {
+        if (e.LeftButton != MouseButtonState.Pressed || _draggedItem == null)
+            return;
+
+        Point pos = e.GetPosition(null);
+        if (Math.Abs(pos.X - _dragStart.X) < SystemParameters.MinimumHorizontalDragDistance &&
+            Math.Abs(pos.Y - _dragStart.Y) < SystemParameters.MinimumVerticalDragDistance)
+            return;
+
+        var dragged = _draggedItem;
+        DragDrop.DoDragDrop(lstFavorites, dragged, DragDropEffects.Move);
+        HideInsertionLine();
+        _draggedItem = null;
+        if (dragged != null && Items.Contains(dragged))
+            lstFavorites.SelectedItem = dragged;
+    }
+
+    private void LstFavorites_DragOver(object sender, DragEventArgs e)
+    {
+        if (!e.Data.GetDataPresent(typeof(FavoriteEntry)))
+        {
+            e.Effects = DragDropEffects.None;
+            HideInsertionLine();
+            e.Handled = true;
+            return;
+        }
+
+        e.Effects = DragDropEffects.Move;
+        e.Handled = true;
+        UpdateInsertionLine(e.GetPosition(lstFavorites));
+    }
+
+    private void LstFavorites_DragLeave(object sender, DragEventArgs e)
+    {
+        Point pos = e.GetPosition(lstFavorites);
+        var bounds = new Rect(0, 0, lstFavorites.ActualWidth, lstFavorites.ActualHeight);
+        if (!bounds.Contains(pos))
+            HideInsertionLine();
+    }
+
+    private void LstFavorites_Drop(object sender, DragEventArgs e)
+    {
+        HideInsertionLine();
+
+        if (e.Data.GetData(typeof(FavoriteEntry)) is not FavoriteEntry dragged)
+            return;
+
+        int oldIndex = Items.IndexOf(dragged);
+        if (oldIndex < 0) return;
+
+        int insertIndex = _insertIndex >= 0
+            ? _insertIndex
+            : GetInsertIndex(e.GetPosition(lstFavorites));
+
+        int newIndex = insertIndex;
+        if (oldIndex < insertIndex)
+            newIndex--;
+
+        if (newIndex < 0 || newIndex >= Items.Count || newIndex == oldIndex)
+        {
+            lstFavorites.SelectedItem = dragged;
+            lstFavorites.Focus();
+            return;
+        }
+
+        Items.Move(oldIndex, newIndex);
+        lstFavorites.SelectedItem = dragged;
+        lstFavorites.Focus();
+    }
+
+    private void UpdateInsertionLine(Point pos)
+    {
+        _insertIndex = GetInsertIndex(pos);
+        EnsureInsertionAdorner();
+        _insertionAdorner?.SetY(GetInsertY(_insertIndex));
+    }
+
+    private int GetInsertIndex(Point pos)
+    {
+        for (int i = 0; i < Items.Count; i++)
+        {
+            if (lstFavorites.ItemContainerGenerator.ContainerFromIndex(i) is not ListBoxItem container)
+                continue;
+
+            double top = container.TranslatePoint(new Point(0, 0), lstFavorites).Y;
+            if (pos.Y < top + container.ActualHeight / 2)
+                return i;
+        }
+
+        return Items.Count;
+    }
+
+    private double GetInsertY(int insertIndex)
+    {
+        if (Items.Count == 0)
+            return 2;
+
+        if (insertIndex >= Items.Count)
+        {
+            if (lstFavorites.ItemContainerGenerator.ContainerFromIndex(Items.Count - 1) is ListBoxItem last)
+                return last.TranslatePoint(new Point(0, last.ActualHeight), lstFavorites).Y;
+            return Math.Max(2, lstFavorites.ActualHeight - 2);
+        }
+
+        if (lstFavorites.ItemContainerGenerator.ContainerFromIndex(insertIndex) is ListBoxItem item)
+            return item.TranslatePoint(new Point(0, 0), lstFavorites).Y;
+
+        return 2;
+    }
+
+    private void EnsureInsertionAdorner()
+    {
+        if (_insertionAdorner != null)
+            return;
+
+        var layer = AdornerLayer.GetAdornerLayer(lstFavorites);
+        if (layer == null)
+            return;
+
+        var brush = TryFindResource("Brush.Selection") as Brush
+                    ?? TryFindResource("Brush.TextPrimary") as Brush
+                    ?? Brushes.Gray;
+        _insertionAdorner = new InsertionLineAdorner(lstFavorites, brush);
+        layer.Add(_insertionAdorner);
+    }
+
+    private void HideInsertionLine()
+    {
+        _insertIndex = -1;
+        if (_insertionAdorner == null)
+            return;
+
+        var layer = AdornerLayer.GetAdornerLayer(lstFavorites);
+        layer?.Remove(_insertionAdorner);
+        _insertionAdorner = null;
+    }
+
+    private FavoriteEntry? GetEntryAt(Point pos)
+    {
+        DependencyObject? el = lstFavorites.InputHitTest(pos) as DependencyObject;
+        while (el != null && el != lstFavorites)
+        {
+            if (el is ListBoxItem item)
+                return item.DataContext as FavoriteEntry;
+            el = VisualTreeHelper.GetParent(el);
+        }
+        return null;
     }
 
     private void SaveAndClose(bool result)
@@ -214,10 +389,30 @@ public partial class FavoriteWindow : Window
         return window.ShowDialog() == true ? (txtName.Text, txtPath.Text) : null;
     }
 
-    protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
+    // Drawn over the list; does not participate in layout, so row height does not jump.
+    private sealed class InsertionLineAdorner : Adorner
     {
-        _settings.Favorites = Items.ToList();
-        try { _settings.Save(); } catch { }
-        base.OnClosing(e);
+        private readonly Pen _pen;
+        private double _y;
+
+        public InsertionLineAdorner(UIElement adorned, Brush brush) : base(adorned)
+        {
+            IsHitTestVisible = false;
+            _pen = new Pen(brush, 2);
+            if (_pen.CanFreeze) _pen.Freeze();
+        }
+
+        public void SetY(double y)
+        {
+            _y = y;
+            InvalidateVisual();
+        }
+
+        protected override void OnRender(DrawingContext dc)
+        {
+            double y = Math.Round(_y) + 0.5;
+            double w = AdornedElement.RenderSize.Width;
+            dc.DrawLine(_pen, new Point(6, y), new Point(Math.Max(6, w - 6), y));
+        }
     }
 }

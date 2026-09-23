@@ -105,7 +105,7 @@ public partial class MainWindow
 
     private async Task OpenFavoritesEditorAsync()
     {
-        var dlg = new FavoriteWindow(_settings) { Owner = this };
+        var dlg = new FavoriteWindow(_settings, _activePane.CurrentPath) { Owner = this };
         if (dlg.ShowDialog() == true && dlg.SelectedResult != null)
             await NavigateToFavoriteAsync(dlg.SelectedResult.Path);
     }

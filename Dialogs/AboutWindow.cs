@@ -53,7 +53,7 @@ public class AboutWindow : Window
 
         var version = new TextBlock
         {
-            Text = "Version 0.69",
+            Text = "Version 0.72",
             Margin = new Thickness(0, 2, 0, 0),
             Opacity = 0.7
         };

@@ -1,4 +1,3 @@
-
 using System.IO;
 using System.Text;
 using System.Windows;
@@ -23,25 +22,15 @@ public partial class ViewerWindow : Window
         new(StringComparer.OrdinalIgnoreCase)
         { ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".ico", ".webp" };
 
-    private static readonly HashSet<string> MarkdownExtensions =
-        new(StringComparer.OrdinalIgnoreCase) { ".md", ".markdown", ".mdown", ".mkd" };
-
-    private static readonly HashSet<string> CodeExtensions =
-        new(StringComparer.OrdinalIgnoreCase)
-        {
-            ".cs", ".c", ".cpp", ".h", ".hpp", ".java", ".py", ".js", ".ts",
-            ".html", ".css", ".xml", ".json", ".yaml", ".yml", ".sh", ".bat",
-            ".cmd", ".ps1", ".php", ".rb", ".go", ".rs", ".swift", ".sql",
-            ".ini", ".cfg", ".conf", ".xaml", ".fs", ".vb", ".lua", ".kt",
-            ".csproj", ".log", ".ejs", ".svg", ".mjs", ".ps1",
-            ".gitignore", ".gitattributes", ".gitconfig", ".gitmodules"
-        };
-
     private readonly string _path;
     private readonly string _displayName;
     private readonly bool _isCodeFile;
 
     private ViewMode _mode = ViewMode.Text;
+
+    // The mode the file was opened in. Alt+1 returns to it: for source code
+    // that is Code (highlighting and line numbers), not plain Text.
+    private readonly ViewMode _startMode;
     private bool _truncated;
     private long _fileSize;
     private string _encodingName = "";
@@ -49,22 +38,17 @@ public partial class ViewerWindow : Window
     private bool _isWrapped;
     private double _imageZoom;
 
-    // Line numbers for highlighted view
-    private int[] _codeLineStarts = Array.Empty<int>();
-    private double _codeLineHeight = 18.0;
-
     // Encoding
     private Encoding? _forcedEncoding;
     private int _encodingIndex;
-    private static readonly string[] EncodingNames =
-    {
-        "Auto", "UTF-8", "UTF-8 BOM", "Windows-1251", "CP866", "UTF-16 LE", "UTF-16 BE"
-    };
 
     // Go to line
     private readonly StringBuilder _gotoBuffer = new();
     private DispatcherTimer? _gotoTimer;
     private const int GotoDebounceMs = 480;
+
+    // Smooth mouse-wheel scrolling
+    private readonly SmoothWheelScroller _scroller;
 
     public ViewerWindow(string path, string displayName)
     {
@@ -74,30 +58,21 @@ public partial class ViewerWindow : Window
         _displayName = displayName;
         Title = $"View: {displayName}";
 
-        string fileName = Path.GetFileName(path);
         string extension = Path.GetExtension(path);
+        string highlightingExtension = GetHighlightingExtension(path);
 
-        _isCodeFile = CodeExtensions.Contains(extension) ||
-                      fileName.StartsWith(".env", StringComparison.OrdinalIgnoreCase) ||
-                      fileName.Equals("Dockerfile", StringComparison.OrdinalIgnoreCase) ||
-                      fileName.Equals("Makefile", StringComparison.OrdinalIgnoreCase);
+        _isCodeFile = FileTypes.Code.Contains(highlightingExtension);
 
         if (ImageExtensions.Contains(extension)) _mode = ViewMode.Image;
-        else if (MarkdownExtensions.Contains(extension)) _mode = ViewMode.Markdown;
+        else if (FileTypes.Markdown.Contains(extension)) _mode = ViewMode.Markdown;
         else if (_isCodeFile) _mode = ViewMode.Markdown;
+
+        _startMode = _mode;
 
         if (TryFindResource("Brush.Background") is Brush background)
             Resources[SystemColors.ControlBrushKey] = background;
 
         docViewer.AddHandler(Hyperlink.RequestNavigateEvent, new RequestNavigateEventHandler(OnLinkNavigate));
-
-        txtContent.AddHandler(ScrollViewer.ScrollChangedEvent,
-            new ScrollChangedEventHandler((_, _) => UpdateLineNumbers()));
-        txtContent.SizeChanged += (_, _) => UpdateLineNumbers();
-
-        docViewer.AddHandler(ScrollViewer.ScrollChangedEvent,
-            new ScrollChangedEventHandler((_, _) => UpdateCodeLineNumbers()));
-        docViewer.SizeChanged += (_, _) => UpdateCodeLineNumbers();
 
         imageScroll.SizeChanged += (_, _) =>
         {
@@ -107,7 +82,15 @@ public partial class ViewerWindow : Window
 
         SourceInitialized += (_, _) => Helpers.SetTitleBarTheme(this, ThemeManager.IsDarkTheme, useSurfaceColor: true);
 
-        _gotoTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(GotoDebounceMs) };
+        _scroller = new SmoothWheelScroller(Dispatcher);
+        _scroller.Attach(avalonCodeViewer);
+        _scroller.Attach(docViewer);
+
+        _gotoTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(GotoDebounceMs)
+        };
+
         _gotoTimer.Tick += (_, _) =>
         {
             _gotoTimer.Stop();
@@ -117,28 +100,8 @@ public partial class ViewerWindow : Window
         ContentRendered += (_, _) => LoadFile();
     }
 
-    private Encoding? GetEncodingByIndex(int index)
-    {
-        try
-        {
-            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
-            return index switch
-            {
-                0 => null,
-                1 => new UTF8Encoding(false),
-                2 => new UTF8Encoding(true),
-                3 => Encoding.GetEncoding(1251),
-                4 => Encoding.GetEncoding(866),
-                5 => Encoding.Unicode,
-                6 => Encoding.BigEndianUnicode,
-                _ => null
-            };
-        }
-        catch
-        {
-            return new UTF8Encoding(false);
-        }
-    }
+    private static string GetHighlightingExtension(string path) =>
+    AvalonEditDraculaTheme.GetHighlightingExtension(path);
 
     private void LoadFile()
     {
@@ -150,7 +113,7 @@ public partial class ViewerWindow : Window
             var info = new FileInfo(_path);
             if (!info.Exists)
             {
-                txtContent.Text = "File not found: " + _path;
+                ShowText("File not found: " + _path);
                 UpdateStatus();
                 return;
             }
@@ -189,11 +152,11 @@ public partial class ViewerWindow : Window
         _truncated = _fileSize > MaxTextBytes;
 
         var bytes = new byte[toRead];
-        int read = stream.Read(bytes, 0, toRead);
+        int read = stream.ReadAtLeast(bytes, toRead, throwOnEndOfStream: false);
         int skip = PreambleLength(encoding, bytes, read);
 
         _encodingName = _forcedEncoding != null
-            ? EncodingNames[_encodingIndex]
+            ? EncodingChoices.Names[_encodingIndex]
             : EncodingName(encoding);
 
         content = encoding.GetString(bytes, skip, read - skip);
@@ -215,7 +178,13 @@ public partial class ViewerWindow : Window
             return;
         }
 
-        ShowText(content);
+        ResetMatches();
+        avalonCodeViewer.Text = content;
+        avalonCodeViewer.FontSize = Math.Max(13, FontSize);
+        avalonCodeViewer.Visibility = Visibility.Visible;
+        docViewer.Visibility = Visibility.Collapsed;
+        AvalonEditDraculaTheme.Apply(avalonCodeViewer, _path, showLineNumbers: false);
+        ShowSurface(codeHost);
         UpdateStatus();
     }
 
@@ -229,30 +198,13 @@ public partial class ViewerWindow : Window
         }
 
         ResetMatches();
-        string ext = Path.GetExtension(_path);
-        double fontSize = Math.Max(13, FontSize);
-
-        docViewer.Document = CodeHighlighter.Highlight(content, ext, fontSize);
-
-        BuildCodeLineStarts(content);
-        _codeLineHeight = fontSize * 1.38;
+        avalonCodeViewer.Text = content;
+        avalonCodeViewer.FontSize = Math.Max(13, FontSize);
+        avalonCodeViewer.Visibility = Visibility.Visible;
+        docViewer.Visibility = Visibility.Collapsed;
+        AvalonEditDraculaTheme.Apply(avalonCodeViewer, _path, showLineNumbers: true);
 
         ShowSurface(codeHost);
-        codeGutter.Visibility = _isCodeFile ? Visibility.Visible : Visibility.Collapsed;
-
-        if (_isCodeFile)
-        {
-            var sb = new StringBuilder(_codeLineStarts.Length * 6);
-            for (int i = 1; i <= _codeLineStarts.Length; i++)
-                sb.AppendLine(i.ToString());
-
-            txtCodeLineNumbers.Text = sb.ToString().TrimEnd('\r', '\n');
-            txtCodeLineNumbers.FontSize = fontSize * 0.95;
-            txtCodeLineNumbers.LineHeight = _codeLineHeight;
-            txtCodeLineNumbers.MinWidth = _codeLineStarts.Length.ToString().Length * (fontSize * 0.62);
-        }
-
-        UpdateCodeLineNumbers();
         UpdateStatus();
     }
 
@@ -267,8 +219,9 @@ public partial class ViewerWindow : Window
 
         ResetMatches();
         docViewer.Document = MarkdownRenderer.Render(content, Math.Max(13, FontSize));
+        avalonCodeViewer.Visibility = Visibility.Collapsed;
+        docViewer.Visibility = Visibility.Visible;
         ShowSurface(codeHost);
-        codeGutter.Visibility = Visibility.Collapsed;
         UpdateStatus();
     }
 
@@ -321,7 +274,8 @@ public partial class ViewerWindow : Window
         catch { return false; }
     }
 
-    private void LoadHex()
+    // notice: a line shown above the dump, e.g. why an image fell back to hex
+    private void LoadHex(string? notice = null)
     {
         using var stream = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
 
@@ -329,11 +283,16 @@ public partial class ViewerWindow : Window
         _truncated = _fileSize > MaxHexBytes;
 
         var bytes = new byte[toRead];
-        int read = stream.Read(bytes, 0, toRead);
+        int read = stream.ReadAtLeast(bytes, toRead, throwOnEndOfStream: false);
 
         _encodingName = "binary";
-        ShowText(FormatHex(bytes, read));
-        UpdateLineNumbers();
+        ResetMatches();
+        avalonCodeViewer.Text = notice + FormatHex(bytes, read);
+        avalonCodeViewer.FontSize = Math.Max(13, FontSize);
+        avalonCodeViewer.Visibility = Visibility.Visible;
+        docViewer.Visibility = Visibility.Collapsed;
+        AvalonEditDraculaTheme.ApplyHex(avalonCodeViewer);
+        ShowSurface(codeHost);
         UpdateStatus();
     }
 
@@ -367,21 +326,53 @@ public partial class ViewerWindow : Window
         return text.ToString();
     }
 
-    private void LoadImage()
+    // =========================================================================
+    // A photo is decoded no larger than the screen.
+    //
+    // Decoded pixels take 4 bytes each: a 50-megapixel photo held 200 MB while
+    // being shown "fit to window" on a screen that can display a fraction of
+    // it. It is now decoded to the screen size, and only when the user zooms
+    // in is it reloaded once at full resolution, so detail at 100 %+ is kept.
+    // =========================================================================
+    private bool _imageReduced;
+
+    private void LoadImage(bool fullResolution = false)
     {
         try
         {
             var bitmap = new BitmapImage();
+            int width, height;
+
             using (var stream = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             {
+                // Header only, no pixels: the original size decides the decode size
+                var header = BitmapFrame.Create(stream, BitmapCreateOptions.DelayCreation, BitmapCacheOption.None);
+                width = header.PixelWidth;
+                height = header.PixelHeight;
+                stream.Position = 0;
+
+                double dpi = VisualTreeHelper.GetDpi(this).DpiScaleX;
+                int limit = (int)(Math.Max(SystemParameters.PrimaryScreenWidth, SystemParameters.PrimaryScreenHeight) * dpi);
+
                 bitmap.BeginInit();
                 bitmap.CacheOption = BitmapCacheOption.OnLoad;
                 bitmap.StreamSource = stream;
+
+                // One side only: the other follows and the aspect ratio is kept
+                if (!fullResolution && Math.Max(width, height) > limit)
+                {
+                    if (width >= height) bitmap.DecodePixelWidth = limit;
+                    else bitmap.DecodePixelHeight = limit;
+                }
+
                 bitmap.EndInit();
             }
+
             bitmap.Freeze();
+            _imageReduced = bitmap.PixelWidth < width;
+
             imgContent.Source = bitmap;
-            _encodingName = $"{bitmap.PixelWidth} x {bitmap.PixelHeight}";
+            _encodingName = $"{width} x {height}";
             _truncated = false;
             _imageZoom = 0;
             UpdateImageScale();
@@ -391,8 +382,7 @@ public partial class ViewerWindow : Window
         catch (Exception ex)
         {
             _mode = ViewMode.Hex;
-            ShowText($"Cannot decode the image.\r\n\r\n{ex.Message}\r\n\r\n");
-            LoadHex();
+            LoadHex($"Cannot decode the image: {ex.Message}\r\n\r\n");
         }
     }
 
@@ -428,6 +418,13 @@ public partial class ViewerWindow : Window
     private void ZoomImage(bool zoomIn)
     {
         if (imgContent.Source == null) return;
+
+        // The first zoom swaps the screen-sized copy for the full image
+        if (_imageReduced)
+        {
+            LoadImage(fullResolution: true);
+            imageScroll.UpdateLayout();
+        }
 
         double viewWidth = imageScroll.ViewportWidth > 0 ? imageScroll.ViewportWidth : imageScroll.ActualWidth;
         double viewHeight = imageScroll.ViewportHeight > 0 ? imageScroll.ViewportHeight : imageScroll.ActualHeight;
@@ -466,7 +463,6 @@ public partial class ViewerWindow : Window
 
     private void ShowSurface(FrameworkElement surface)
     {
-        textHost.Visibility = ReferenceEquals(surface, textHost) ? Visibility.Visible : Visibility.Collapsed;
         codeHost.Visibility = ReferenceEquals(surface, codeHost) ? Visibility.Visible : Visibility.Collapsed;
         imageScroll.Visibility = ReferenceEquals(surface, imageScroll) ? Visibility.Visible : Visibility.Collapsed;
         FocusActiveSurface();
@@ -476,100 +472,23 @@ public partial class ViewerWindow : Window
     {
         _ = Dispatcher.BeginInvoke(() =>
         {
-            FrameworkElement target = textHost.Visibility == Visibility.Visible ? txtContent :
-                                      codeHost.Visibility == Visibility.Visible ? docViewer : imageScroll;
+            FrameworkElement target = codeHost.Visibility == Visibility.Visible
+                ? (avalonCodeViewer.Visibility == Visibility.Visible ? avalonCodeViewer : docViewer)
+                : imageScroll;
             target.Focus();
             Keyboard.Focus(target);
         }, DispatcherPriority.Input);
     }
 
+    // Plain messages (file not found, read errors) in the same editor as text
     private void ShowText(string content)
     {
         ResetMatches();
-        ShowSurface(textHost);
-        txtContent.Text = content;
-        txtContent.CaretIndex = 0;
-        BuildLineStarts(content);
-        UpdateLineNumbers();
-    }
-
-    // ===== Line numbers (Text mode) =====
-    private int[] _lineStarts = Array.Empty<int>();
-
-    private void BuildLineStarts(string content)
-    {
-        var starts = new List<int> { 0 };
-        for (int i = 0; i < content.Length; i++)
-            if (content[i] == '\n') starts.Add(i + 1);
-        _lineStarts = starts.ToArray();
-    }
-
-    private void UpdateLineNumbers()
-    {
-        bool show = _mode == ViewMode.Text && textHost.Visibility == Visibility.Visible && _isCodeFile;
-        gutter.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
-        if (!show) return;
-
-        try
-        {
-            int first = txtContent.GetFirstVisibleLineIndex();
-            int last = txtContent.GetLastVisibleLineIndex();
-            if (first < 0 || last < first) { txtLineNumbers.Text = ""; return; }
-
-            var text = new StringBuilder((last - first + 1) * 8);
-            int previous = -1;
-            for (int line = first; line <= last; line++)
-            {
-                int characterIndex = txtContent.GetCharacterIndexFromLineIndex(line);
-                int logical = LogicalLineOf(characterIndex);
-                text.AppendLine(logical == previous ? "" : (logical + 1).ToString());
-                previous = logical;
-            }
-            txtLineNumbers.Text = text.ToString().TrimEnd('\r', '\n');
-            txtLineNumbers.MinWidth = _lineStarts.Length.ToString().Length * (FontSize * 0.62);
-        }
-        catch { txtLineNumbers.Text = ""; }
-    }
-
-    private int LogicalLineOf(int characterIndex)
-    {
-        int index = Array.BinarySearch(_lineStarts, characterIndex);
-        return index >= 0 ? index : ~index - 1;
-    }
-
-    // ===== Line numbers (Code mode) =====
-    private void BuildCodeLineStarts(string content)
-    {
-        var starts = new List<int> { 0 };
-        for (int i = 0; i < content.Length; i++)
-            if (content[i] == '\n') starts.Add(i + 1);
-        _codeLineStarts = starts.ToArray();
-    }
-
-    private void UpdateCodeLineNumbers()
-    {
-        if (codeGutter.Visibility != Visibility.Visible) return;
-
-        try
-        {
-            var docScroll = FindScrollViewer(docViewer);
-            if (docScroll == null || codeGutterScroll == null) return;
-            codeGutterScroll.ScrollToVerticalOffset(docScroll.VerticalOffset);
-        }
-        catch { }
-    }
-
-    private static ScrollViewer? FindScrollViewer(DependencyObject? root)
-    {
-        if (root == null) return null;
-        if (root is ScrollViewer sv) return sv;
-
-        for (int i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
-        {
-            var result = FindScrollViewer(VisualTreeHelper.GetChild(root, i));
-            if (result != null) return result;
-        }
-        return null;
+        avalonCodeViewer.Text = content;
+        avalonCodeViewer.Visibility = Visibility.Visible;
+        docViewer.Visibility = Visibility.Collapsed;
+        AvalonEditDraculaTheme.Apply(avalonCodeViewer, _path, showLineNumbers: false);
+        ShowSurface(codeHost);
     }
 
     private void UpdateStatus()
@@ -581,7 +500,9 @@ public partial class ViewerWindow : Window
                 : $"  •  showing the first {Helpers.FormatSize(MaxTextBytes)}"
             : "";
 
-        string wrapState = _isWrapped && _mode == ViewMode.Text ? "  •  Wrap: On" : "";
+        string wrapState = _isWrapped && _mode != ViewMode.Image && avalonCodeViewer.Visibility == Visibility.Visible
+            ? "  •  Wrap: On"
+            : "";
         string zoomState = "";
         if (_mode == ViewMode.Image && imgContent.Source != null)
             zoomState = _imageZoom == 0 ? "  •  Fit to window" : $"  •  {Math.Round(_imageZoom * 100)}%";
@@ -590,7 +511,7 @@ public partial class ViewerWindow : Window
 
         txtEncoding.Text = _forcedEncoding == null
             ? (string.IsNullOrEmpty(_encodingName) ? "Auto" : _encodingName)
-            : EncodingNames[_encodingIndex];
+            : EncodingChoices.Names[_encodingIndex];
 
         txtStatusLeft.Text = $"{_displayName}  •  {size}";
 
@@ -632,9 +553,7 @@ public partial class ViewerWindow : Window
     private void ToggleWrap()
     {
         _isWrapped = !_isWrapped;
-        txtContent.TextWrapping = _isWrapped ? TextWrapping.Wrap : TextWrapping.NoWrap;
-        txtContent.HorizontalScrollBarVisibility = _isWrapped ? ScrollBarVisibility.Disabled : ScrollBarVisibility.Auto;
-        UpdateLineNumbers();
+        avalonCodeViewer.WordWrap = _isWrapped;
         UpdateStatus();
     }
 
@@ -686,7 +605,10 @@ public partial class ViewerWindow : Window
         UpdateSearchCounter();
     }
 
-    private int MatchCount => _mode == ViewMode.Markdown ? _documentMatches.Count : _textMatches.Count;
+    private int MatchCount =>
+        _mode == ViewMode.Markdown && !_isCodeFile
+            ? _documentMatches.Count
+            : _textMatches.Count;
 
     private void UpdateSearchCounter()
     {
@@ -710,13 +632,13 @@ public partial class ViewerWindow : Window
         ResetMatches();
         _matchQuery = needle;
 
-        if (_mode == ViewMode.Markdown)
+        if (_mode == ViewMode.Markdown && !_isCodeFile)
         {
             CollectDocumentMatches(needle);
             return;
         }
 
-        string haystack = txtContent.Text;
+        string haystack = avalonCodeViewer.Text;
         int from = 0;
         while (from <= haystack.Length - needle.Length)
         {
@@ -756,29 +678,20 @@ public partial class ViewerWindow : Window
 
     private void ShowCurrentMatch()
     {
-        if (_mode == ViewMode.Markdown)
+        if (_mode == ViewMode.Markdown && !_isCodeFile)
         {
             ClearHighlight();
             var range = _documentMatches[_matchIndex];
-            if (TryFindResource("Brush.MarkedText") is Brush marked)
-                range.ApplyPropertyValue(TextElement.BackgroundProperty, marked);
-            range.ApplyPropertyValue(TextElement.ForegroundProperty, Brushes.Black);
+            range.ApplyPropertyValue(TextElement.BackgroundProperty, DraculaPalette.CurrentLineBrush);
+            range.ApplyPropertyValue(TextElement.ForegroundProperty, DraculaPalette.ForegroundBrush);
             _highlighted = range;
             (range.Start.Parent as FrameworkContentElement)?.BringIntoView();
             return;
         }
 
         int offset = _textMatches[_matchIndex];
-        txtContent.Select(offset, _matchQuery.Length);
-        int line = txtContent.GetLineIndexFromCharacterIndex(offset);
-        txtContent.ScrollToLine(Math.Max(0, line - 3));
-        txtContent.UpdateLayout();
-
-        if (txtFind.IsFocused)
-        {
-            txtContent.Focus();
-            txtFind.Focus();
-        }
+        avalonCodeViewer.Select(offset, _matchQuery.Length);
+        avalonCodeViewer.ScrollToLine(avalonCodeViewer.Document.GetLineByOffset(offset).LineNumber);
     }
 
     private void ClearHighlight()
@@ -799,9 +712,21 @@ public partial class ViewerWindow : Window
 
         e.Handled = true;
         if (_mode == ViewMode.Image)
+        {
             ZoomImage(e.Delta > 0);
+        }
         else
-            FontSize = e.Delta > 0 ? Math.Min(72, FontSize + 2) : Math.Max(8, FontSize - 2);
+        {
+            SetTextFontSize(e.Delta > 0
+                ? Math.Min(72, FontSize + 2)
+                : Math.Max(8, FontSize - 2));
+        }
+    }
+
+    private void SetTextFontSize(double fontSize)
+    {
+        FontSize = fontSize;
+        avalonCodeViewer.FontSize = Math.Max(13, fontSize);
     }
 
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
@@ -819,6 +744,14 @@ public partial class ViewerWindow : Window
                 _gotoTimer?.Stop();
                 _gotoTimer?.Start();
                 UpdateStatus();
+                return;
+            }
+
+            if (e.Key == Key.Enter && _gotoBuffer.Length > 0)
+            {
+                e.Handled = true;
+                _gotoTimer?.Stop();
+                ExecuteGotoLine();
                 return;
             }
 
@@ -877,7 +810,7 @@ public partial class ViewerWindow : Window
                 UpdateStatus();
             }
             else if (Application.Current.TryFindResource("AppFontSize") is double defaultSize)
-                FontSize = defaultSize;
+                SetTextFontSize(defaultSize);
             return;
         }
 
@@ -885,7 +818,7 @@ public partial class ViewerWindow : Window
         {
             e.Handled = true;
             if (_mode == ViewMode.Image) ZoomImage(true);
-            else FontSize = Math.Min(72, FontSize + 2);
+            else SetTextFontSize(Math.Min(72, FontSize + 2));
             return;
         }
 
@@ -893,7 +826,7 @@ public partial class ViewerWindow : Window
         {
             e.Handled = true;
             if (_mode == ViewMode.Image) ZoomImage(false);
-            else FontSize = Math.Max(8, FontSize - 2);
+            else SetTextFontSize(Math.Max(8, FontSize - 2));
             return;
         }
 
@@ -923,11 +856,18 @@ public partial class ViewerWindow : Window
             return;
         }
 
-        if (!ctrl && !txtFind.IsFocused)
+        // Plain 1 and 2 are digits of a line number, so the modes live on Alt
+        if (Keyboard.Modifiers == ModifierKeys.Alt && e.Key == Key.System)
         {
-            if (e.Key is Key.D1 or Key.NumPad1) { e.Handled = true; _mode = ViewMode.Text; LoadFile(); }
-            else if (e.Key is Key.D2 or Key.NumPad2) { e.Handled = true; _mode = ViewMode.Hex; LoadFile(); }
-            else if (e.Key == Key.W) { e.Handled = true; ToggleWrap(); }
+            if (e.SystemKey is Key.D1 or Key.NumPad1) { e.Handled = true; _mode = _startMode; LoadFile(); }
+            else if (e.SystemKey is Key.D2 or Key.NumPad2) { e.Handled = true; _mode = ViewMode.Hex; LoadFile(); }
+            return;
+        }
+
+        if (!ctrl && !txtFind.IsFocused && e.Key == Key.W)
+        {
+            e.Handled = true;
+            ToggleWrap();
         }
     }
 
@@ -940,8 +880,8 @@ public partial class ViewerWindow : Window
     private void TxtEncoding_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
         e.Handled = true;
-        _encodingIndex = (_encodingIndex + 1) % EncodingNames.Length;
-        _forcedEncoding = GetEncodingByIndex(_encodingIndex);
+        _encodingIndex = (_encodingIndex + 1) % EncodingChoices.Names.Length;
+        _forcedEncoding = EncodingChoices.Get(_encodingIndex);
         LoadFile();
     }
 
@@ -949,7 +889,7 @@ public partial class ViewerWindow : Window
     {
         string ext = Path.GetExtension(_path);
         if (ImageExtensions.Contains(ext)) return [ViewMode.Image, ViewMode.Hex];
-        if (MarkdownExtensions.Contains(ext)) return [ViewMode.Text, ViewMode.Markdown, ViewMode.Hex];
+        if (FileTypes.Markdown.Contains(ext)) return [ViewMode.Text, ViewMode.Markdown, ViewMode.Hex];
         if (_isCodeFile) return [ViewMode.Text, ViewMode.Markdown, ViewMode.Hex];
         return [ViewMode.Text, ViewMode.Hex];
     }
@@ -977,27 +917,13 @@ public partial class ViewerWindow : Window
         _gotoBuffer.Clear();
         UpdateStatus();
 
-        int maxLine = (_mode == ViewMode.Markdown && _isCodeFile)
-            ? Math.Max(1, _codeLineStarts.Length)
-            : Math.Max(1, _lineStarts.Length);
+        // Rendered Markdown and images have no lines
+        if (avalonCodeViewer.Visibility != Visibility.Visible || codeHost.Visibility != Visibility.Visible)
+            return;
 
-        line = Math.Min(line, maxLine);
-
-        if (_mode is ViewMode.Text or ViewMode.Hex)
-        {
-            int target = Math.Max(0, line - 1);
-            txtContent.ScrollToLine(target);
-            try
-            {
-                txtContent.CaretIndex = txtContent.GetCharacterIndexFromLineIndex(target);
-            }
-            catch { }
-        }
-        else if (_mode == ViewMode.Markdown)
-        {
-            var sv = FindScrollViewer(docViewer);
-            if (sv != null)
-                sv.ScrollToVerticalOffset((line - 1) * _codeLineHeight);
-        }
+        line = Math.Min(line, avalonCodeViewer.Document.LineCount);
+        avalonCodeViewer.ScrollToLine(line);
+        avalonCodeViewer.CaretOffset = avalonCodeViewer.Document.GetLineByNumber(line).Offset;
+        avalonCodeViewer.Focus();
     }
 }

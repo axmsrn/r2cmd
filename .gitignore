@@ -1,4 +1,6 @@
 bin/
 obj/
 publish/
-.gitignore
+*.ico
+*.jpg
+*.png

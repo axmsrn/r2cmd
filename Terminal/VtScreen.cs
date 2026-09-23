@@ -10,11 +10,15 @@ public enum CellFlags : byte { None = 0, Bold = 1, Underline = 2, Inverse = 4, W
 
 // Fg/Bg: -1 means "theme default", 0..255 is the ANSI palette,
 // anything >= TrueColorBase is 0xRRGGBB packed with a marker bit.
+//
+// Field order matters for size: the ints first, then the char and the byte,
+// gives 12 bytes per cell. The old order (char, int, int, byte) padded every
+// cell to 16. Screen and scrollback hold hundreds of thousands of cells.
 public struct Cell
 {
-    public char Ch;
     public int Fg;
     public int Bg;
+    public char Ch;
     public CellFlags Flags;
 }
 
@@ -161,9 +165,29 @@ public sealed class VtScreen
     private readonly List<int> _params = new();
     private int _paramValue = -1;
     private char _privateMarker;
+    private char _lastChar = '\0';
 
     // Buffer for reading Operating System Commands (OSC) like Window Titles or OSC 52 clipboard
     private readonly StringBuilder _oscBuffer = new();
+
+    // Persistent suppression list to survive ConPTY screen redraws (resizes)
+    private readonly List<string> _suppressedCommands = new();
+
+    public void SuppressNextEcho(string text)
+    {
+        if (!_suppressedCommands.Contains(text))
+        {
+            _suppressedCommands.Add(text);
+            // Keep history bounded to prevent memory growth and stale matches
+            if (_suppressedCommands.Count > 10) _suppressedCommands.RemoveAt(0);
+        }
+    }
+
+    // Drops the suppression filter when the user takes manual control
+    public void ClearSuppressedCommands()
+    {
+        _suppressedCommands.Clear();
+    }
 
     public VtScreen(int cols, int rows)
     {
@@ -213,6 +237,16 @@ public sealed class VtScreen
             return;
         }
 
+        // Height-only: do not reflow. ConPTY keeps every cell at the same (x, y)
+        // and adds blank rows at the bottom. Reflow used to merge scrollback into
+        // the screen and pin the result to the bottom, so PowerShell's CUP redraw
+        // of the prompt landed in the middle of the shifted text and overwrote it.
+        if (cols == Cols)
+        {
+            ResizePrimaryHeight(rows);
+            return;
+        }
+
         // --- PRIMARY BUFFER TEXT REFLOW ALGORITHM (Flex) ---
 
         var logicalLines = new List<List<Cell>>();
@@ -258,13 +292,9 @@ public sealed class VtScreen
             }
         }
 
-        // 1. Extract and unwrap the scrollback history
-        for (int i = 0; i < _scrollback.Count; i++)
-        {
-            ProcessPhysicalLine(_scrollback[i], false);
-        }
-
-        // 2. Extract and unwrap the current visible screen
+        // 1. Extract and unwrap the current visible screen ONLY.
+        // DO NOT unwrap scrollback history. ConPTY manages its own view and does not
+        // pull old history into the active screen upon expanding.
         for (int y = 0; y < Rows; y++)
         {
             var line = new Cell[Cols];
@@ -322,9 +352,26 @@ public sealed class VtScreen
                 newPhysicalLines.Add(physLine);
             }
         }
+        // 4. Trim empty lines at the bottom so they don't get pushed into history on shrink
+        while (newPhysicalLines.Count > 0)
+        {
+            int lastIdx = newPhysicalLines.Count - 1;
+            if (lastIdx <= newCursorY) break;
 
-        // 4. Distribute the reflowed lines back to scrollback and the primary screen
-        _scrollback.Clear();
+            bool isEmpty = true;
+            for (int x = 0; x < cols; x++)
+            {
+                var c = newPhysicalLines[lastIdx][x];
+                if (c.Ch != ' ' || c.Fg != -1 || c.Bg != -1 || (c.Flags & ~CellFlags.Wrapped) != CellFlags.None)
+                {
+                    isEmpty = false;
+                    break;
+                }
+            }
+            if (!isEmpty) break;
+            newPhysicalLines.RemoveAt(lastIdx);
+        }
+
         Buffer = new Cell[cols * rows];
         Clear(Buffer);
 
@@ -332,26 +379,64 @@ public sealed class VtScreen
         int linesToPrimary = Math.Min(totalLines, rows);
         int linesToScrollback = totalLines - linesToPrimary;
 
+        // Overflow of the reflowed *screen* becomes new history.
+        // Old scrollback stays; do not Clear() it.
         for (int i = 0; i < linesToScrollback; i++)
         {
-            _scrollback.Add(newPhysicalLines[i]);
+            var line = newPhysicalLines[i];
+            _scrollback.Add(TrimForHistory(line, 0, line.Length));
         }
 
         int primaryStartIndex = totalLines - linesToPrimary;
-        int destinationStartY = rows - linesToPrimary;
 
         for (int i = 0; i < linesToPrimary; i++)
         {
             var sourceLine = newPhysicalLines[primaryStartIndex + i];
-            Array.Copy(sourceLine, 0, Buffer, (destinationStartY + i) * cols, cols);
+            Array.Copy(sourceLine, 0, Buffer, i * cols, cols);
         }
 
         // 5. Update and clamp the cursor to its new mapped position
         CursorX = Math.Max(0, Math.Min(newCursorX, cols - 1));
-        CursorY = Math.Max(0, Math.Min(newCursorY - linesToScrollback + destinationStartY, rows - 1));
+        CursorY = Math.Max(0, Math.Min(newCursorY - linesToScrollback, rows - 1));
 
         Cols = cols;
         Rows = rows;
+        _scrollTop = 0;
+        _scrollBottom = rows - 1;
+        _wrapPending = false;
+        Version++;
+    }
+
+    // Extra rows appear below the existing cells; the cursor stays put. Matches
+    // ConPTY / xterm. Shrinking drops rows from the bottom unless that would hide
+    // the cursor, in which case the top of the screen is pushed into scrollback.
+    private void ResizePrimaryHeight(int rows)
+    {
+        var next = new Cell[Cols * rows];
+        Clear(next);
+
+        if (rows >= Rows)
+        {
+            Array.Copy(Buffer, 0, next, 0, Buffer.Length);
+        }
+        else
+        {
+            int srcStart = 0;
+            if (CursorY >= rows)
+            {
+                srcStart = CursorY - rows + 1;
+                for (int i = 0; i < srcStart; i++)
+                    _scrollback.Add(TrimForHistory(Buffer, i * Cols, Cols));
+                CursorY -= srcStart;
+                _savedY = Math.Max(0, _savedY - srcStart);
+            }
+
+            Array.Copy(Buffer, srcStart * Cols, next, 0, Cols * rows);
+        }
+
+        Buffer = next;
+        Rows = rows;
+        _savedY = Math.Min(_savedY, rows - 1);
         _scrollTop = 0;
         _scrollBottom = rows - 1;
         _wrapPending = false;
@@ -378,10 +463,61 @@ public sealed class VtScreen
         return next;
     }
 
-    public void Write(char[] data, int count)
+    // Zero-allocation text writing using ReadOnlySpan
+    public void Write(ReadOnlySpan<char> data)
     {
-        for (int i = 0; i < count; i++) Feed(data[i]);
+        for (int i = 0; i < data.Length; i++) Feed(data[i]);
         Version++;
+    }
+
+    // =========================================================================
+    // Blanks out suppressed command echoes on the visible screen. This makes
+    // the suppression immune to ConPTY resizes and VT cursor jumps.
+    //
+    // Called by the host once per batch of output, not after every chunk: the
+    // pass scans the whole screen for every suppressed command, and heavy
+    // output (a build log, dir /s) arrives as thousands of 4 KB chunks, each of
+    // which used to trigger a full scan. The screen is drawn once per batch
+    // anyway, so masking more often never showed anything different.
+    // =========================================================================
+    public void MaskSuppressedCommands()
+    {
+        if (_suppressedCommands.Count == 0) return;
+
+        for (int i = 0; i < Buffer.Length; i++)
+        {
+            foreach (string cmd in _suppressedCommands)
+            {
+                int cmdLen = cmd.Length;
+                if (cmdLen == 0 || i + cmdLen > Buffer.Length) continue;
+
+                if (Buffer[i].Ch != cmd[0]) continue;
+
+                // BUGFIX: Skip masking if the command touches or is below the active cursor row.
+                // This prevents erasing the command when the user recalls it via history (Up Arrow),
+                // as the recalled text sits on the active CursorY line until 'Enter' is pressed.
+                int cmdEndRow = (i + cmdLen - 1) / Cols;
+                if (cmdEndRow >= CursorY) continue;
+
+                bool match = true;
+                for (int j = 1; j < cmdLen; j++)
+                {
+                    if (Buffer[i + j].Ch != cmd[j])
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+
+                if (match)
+                {
+                    for (int j = 0; j < cmdLen; j++)
+                    {
+                        Buffer[i + j].Ch = ' ';
+                    }
+                }
+            }
+        }
     }
 
     // ===================== Parser =====================
@@ -493,6 +629,13 @@ public sealed class VtScreen
             case '@': InsertChars(P(0, 1)); break;
             case 'P': DeleteChars(P(0, 1)); break;
             case 'X': EraseChars(P(0, 1)); break;
+            case 'b':
+                int repCount = P(0, 1);
+                if (_lastChar != '\0')
+                {
+                    for (int i = 0; i < repCount; i++) PutChar(_lastChar);
+                }
+                break;
             case 'S': ScrollUp(P(0, 1)); break;
             case 'T': ScrollDown(P(0, 1)); break;
 
@@ -668,6 +811,7 @@ public sealed class VtScreen
         }
 
         Buffer[CursorY * Cols + CursorX] = new Cell { Ch = c, Fg = _curFg, Bg = _curBg, Flags = _curFlags };
+        _lastChar = c;
 
         if (CursorX + 1 >= Cols) _wrapPending = true;  // deferred wrap, matches xterm
         else CursorX++;
@@ -694,17 +838,40 @@ public sealed class VtScreen
         if (!_inAltBuffer && _scrollTop == 0)
         {
             for (int i = 0; i < n; i++)
-            {
-                var line = new Cell[Cols];
-                Array.Copy(Buffer, i * Cols, line, 0, Cols);
-                _scrollback.Add(line);
-            }
+                _scrollback.Add(TrimForHistory(Buffer, i * Cols, Cols));
         }
 
         for (int y = _scrollTop; y <= _scrollBottom - n; y++)
             Array.Copy(Buffer, (y + n) * Cols, Buffer, y * Cols, Cols);
 
         for (int y = _scrollBottom - n + 1; y <= _scrollBottom; y++) ClearRow(y);
+    }
+
+    // =========================================================================
+    // A history line keeps only up to its last visible cell.
+    //
+    // Lines used to be stored at full screen width: a 20-character prompt on a
+    // 300-column terminal took 300 cells, almost all of them blank. With 5000
+    // lines of history that is megabytes of spaces. The renderer and the text
+    // selection already take each history line's own length (lines kept from
+    // an earlier, narrower width have always been shorter), so a trimmed line
+    // simply shows the default background after its end, as the blanks did.
+    //
+    // A soft-wrapped line is kept whole: its last cell carries the Wrapped flag.
+    // =========================================================================
+    private static Cell[] TrimForHistory(Cell[] source, int start, int length)
+    {
+        int keep = length;
+        while (keep > 0)
+        {
+            var c = source[start + keep - 1];
+            if (c.Ch != ' ' || c.Fg != -1 || c.Bg != -1 || c.Flags != CellFlags.None) break;
+            keep--;
+        }
+
+        var line = new Cell[keep];
+        Array.Copy(source, start, line, 0, keep);
+        return line;
     }
 
     private void ScrollDown(int n)

@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text;
 using System.Text.Json;
 
 namespace R2Cmd;
@@ -15,6 +16,10 @@ public sealed class AppSettings
     // INSTANCE CACHE (Singleton)
     // ==========================================
     private static AppSettings? _instance;
+
+    // Created once: building JsonSerializerOptions per call throws away the
+    // serializer's metadata cache every time (analyzer CA1869)
+    private static readonly JsonSerializerOptions s_jsonOptions = new() { WriteIndented = true };
 
     public List<FavoriteEntry> Favorites { get; set; } = new();
 
@@ -47,6 +52,18 @@ public sealed class AppSettings
     public int SshIdleMinutes { get; set; } = 5;
 
     // ==========================================
+    // RENDERING
+    // ==========================================
+    // false (default): WPF draws on the CPU. The graphics driver's user-mode
+    // component is then never loaded into the process, which measured at about
+    // 150-220 MB of private memory on its own, while scrolling and live file
+    // lists stayed smooth even at 3840x2160.
+    // true: WPF draws through Direct3D on the GPU.
+    // Read once at startup, before the first window is created, so a change
+    // takes effect after a restart.
+    public bool HardwareRendering { get; set; } = false;
+
+    // ==========================================
     // UI SCALE (Ctrl+Plus / Ctrl+Minus / Ctrl+0)
     // ==========================================
     // 1.0 is 100%. Settings files written before this property existed simply
@@ -69,7 +86,7 @@ public sealed class AppSettings
     // Saved path to custom editor via F3/F4
     public string CustomEditorPath { get; set; } = "";
 
-    // List of the last 5 search masks
+    // List of the last search masks
     public List<string> SearchHistory { get; set; } = new();
 
     // List of the last 10 searched words in file contents
@@ -85,6 +102,9 @@ public sealed class AppSettings
     // Width of the terminal column in device independent pixels.
     // Only used when the terminal shares the pane with the file list.
     public double TerminalWidth { get; set; } = 420;
+
+    // Height of the global bottom terminal. Kept across sessions.
+    public double TerminalHeight { get; set; } = 250;
 
     // Commands executed in the embedded terminal, oldest first (F9 shows them)
     public List<string> TerminalHistory { get; set; } = new();
@@ -105,7 +125,7 @@ public sealed class AppSettings
             if (File.Exists(FilePath))
             {
                 string json = File.ReadAllText(FilePath);
-                _instance = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+                _instance = JsonSerializer.Deserialize<AppSettings>(json, s_jsonOptions) ?? new AppSettings();
             }
             else
             {
@@ -129,9 +149,18 @@ public sealed class AppSettings
         string? dir = Path.GetDirectoryName(FilePath);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-        string json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
+        string json = JsonSerializer.Serialize(this, s_jsonOptions);
         string tmp = FilePath + ".tmp";
-        File.WriteAllText(tmp, json);
+
+        // WriteThrough: the bytes are on the disk before the rename below. Without
+        // it a power loss right after the rename could leave settings.json empty,
+        // because the rename may reach the disk before the file contents do.
+        using (var stream = new FileStream(tmp, FileMode.Create, FileAccess.Write,
+                   FileShare.None, bufferSize: 4096, FileOptions.WriteThrough))
+        using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
+        {
+            writer.Write(json);
+        }
 
         // Copy+Delete had a window where a crash mid-copy could leave settings.json
         // partially written. File.Move(overwrite) on the same volume is a single

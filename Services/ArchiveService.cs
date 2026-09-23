@@ -2,7 +2,9 @@ using System;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Formats.Tar;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -46,8 +48,34 @@ public static class ArchiveService
     private const int SfxScanLimit = 32 * 1024 * 1024;
     private const int SfxScanChunk = 1 << 20;
 
-    public static bool IsArchiveFile(string path) =>
-        ArchiveExtensions.Contains(Path.GetExtension(path)) || IsSelfExtracting(path);
+    public static bool IsArchiveFile(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        if (IsSelfExtracting(path)) return true;
+        if (IsCompressedTar(path)) return true;
+        return ArchiveExtensions.Contains(Path.GetExtension(path));
+    }
+
+    private static bool IsCompressedTar(string path)
+    {
+        string name = Path.GetFileName(path);
+        return name.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".tgz", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // GNU tar stores members as "./file". That would show a folder named "."
+    // and break ExtractFiles key lookup against ListChildren keys.
+    private static string NormalizeTarKey(string? key)
+    {
+        if (string.IsNullOrEmpty(key)) return "";
+        string s = key.Replace('\\', '/');
+        while (s.StartsWith("./", StringComparison.Ordinal))
+            s = s.Substring(2);
+        return s.Trim('/');
+    }
+
+    private static bool IsTarDirectory(TarEntry entry) =>
+        entry.EntryType is TarEntryType.Directory or TarEntryType.DirectoryList;
 
     /// <summary>True when this executable has already been opened as an archive.</summary>
     public static bool IsSelfExtracting(string path) =>
@@ -154,6 +182,80 @@ public static class ArchiveService
         return OpenAt(archivePath, offset > 0 ? offset : 0);
     }
 
+    private readonly record struct CachedEntry(string Key, bool IsDirectory, long Size, DateTime? Modified);
+
+    private sealed class ArchiveIndex
+    {
+        public long Length;
+        public DateTime LastWriteUtc;
+        public CachedEntry[] Entries = Array.Empty<CachedEntry>();
+    }
+
+    private static readonly ConcurrentDictionary<string, ArchiveIndex> s_index =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private const int MaxCachedIndexes = 8;
+
+    private static ArchiveIndex GetIndex(string archivePath)
+    {
+        var info = new FileInfo(archivePath);
+        if (s_index.TryGetValue(archivePath, out var cached) &&
+            cached.Length == info.Length &&
+            cached.LastWriteUtc == info.LastWriteTimeUtc)
+            return cached;
+
+        var list = new List<CachedEntry>();
+        if (IsCompressedTar(archivePath))
+        {
+            // Stream the gzip layer and read tar headers only. copyData: false
+            // skips each file body so listing a backup does not inflate working set.
+            using var gzip = new GZipStream(OpenArchiveStream(archivePath), CompressionMode.Decompress);
+            using var tar = new TarReader(gzip);
+            TarEntry? entry;
+            while ((entry = tar.GetNextEntry(copyData: false)) != null)
+            {
+                string key = NormalizeTarKey(entry.Name);
+                if (key.Length == 0 || key == "." || key == "..") continue;
+                list.Add(new CachedEntry(
+                    key,
+                    IsTarDirectory(entry),
+                    entry.Length,
+                    NullableTime(entry)));
+            }
+        }
+        else
+        {
+            using var stream = OpenArchiveStream(archivePath);
+            using var archive = ArchiveFactory.OpenArchive(stream);
+            foreach (var entry in archive.Entries)
+            {
+                if (entry.Key is null) continue;
+                string key = NormalizeTarKey(entry.Key);
+                if (key.Length == 0) continue;
+                list.Add(new CachedEntry(
+                    key,
+                    entry.IsDirectory,
+                    entry.Size,
+                    entry.LastModifiedTime));
+            }
+        }
+
+        var index = new ArchiveIndex
+        {
+            Length = info.Length,
+            LastWriteUtc = info.LastWriteTimeUtc,
+            Entries = list.ToArray()
+        };
+
+        // The cache used to keep every archive ever opened for the whole
+        // session; a single archive with 100k entries holds megabytes of keys.
+        // A handful is plenty for moving around inside the archives in use.
+        if (s_index.Count >= MaxCachedIndexes) s_index.Clear();
+
+        s_index[archivePath] = index;
+        return index;
+    }
+
     // =========================================================================
     // Read-only view of a file starting at a fixed offset.
     // Overrides Span<byte> reads to ensure high performance on .NET 8+.
@@ -221,15 +323,10 @@ public static class ArchiveService
         int files = 0;
         long bytes = 0;
 
-        using var stream = OpenArchiveStream(archivePath);
-        using var archive = ArchiveFactory.OpenArchive(stream);
-
-        foreach (var entry in archive.Entries)
+        foreach (var entry in GetIndex(archivePath).Entries)
         {
-            if (entry.Key is null || entry.IsDirectory) continue;
-
-            string key = entry.Key.Replace('\\', '/');
-            if (prefix.Length > 0 && !key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+            if (entry.IsDirectory) continue;
+            if (prefix.Length > 0 && !entry.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
 
             files++;
             bytes += entry.Size;
@@ -259,45 +356,90 @@ public static class ArchiveService
     {
         var found = new List<ArchiveNode>();
 
+        if (IsCompressedTar(archivePath))
+        {
+            using var gzip = new GZipStream(OpenArchiveStream(archivePath), CompressionMode.Decompress);
+            using var tar = new TarReader(gzip);
+            TarEntry? entry;
+
+            // =================================================================
+            // copyData: false, always. With true, TarReader copies the body of
+            // EVERY entry into a MemoryStream before returning it, including
+            // entries whose name does not match and entries far larger than
+            // maxContentSize: one multi-gigabyte file inside a .tar.gz could
+            // exhaust memory. Without the copy, DataStream reads straight from
+            // the archive and stays valid until the next GetNextEntry, which
+            // skips whatever was not read.
+            // =================================================================
+            while ((entry = tar.GetNextEntry(copyData: false)) != null)
+            {
+                token.ThrowIfCancellationRequested();
+                if (IsTarDirectory(entry)) continue;
+
+                string key = NormalizeTarKey(entry.Name);
+                if (key.Length == 0) continue;
+
+                string name = Path.GetFileName(key);
+                bool nameOk = nameMatches(name);
+
+                if (contentMatches == null)
+                {
+                    if (nameOk) found.Add(new ArchiveNode(name, key, false, entry.Length, NullableTime(entry)));
+                    continue;
+                }
+
+                if (!nameOk || entry.Length > maxContentSize || entry.DataStream == null)
+                    continue;
+
+                bool hit = contentMatches(entry.DataStream);
+                if (hit) found.Add(new ArchiveNode(name, key, false, entry.Length, NullableTime(entry)));
+            }
+
+            return found;
+        }
+
         using var stream = OpenArchiveStream(archivePath);
         using var archive = ArchiveFactory.OpenArchive(stream);
 
-        foreach (var entry in archive.Entries)
+        foreach (var item in archive.Entries)
         {
             token.ThrowIfCancellationRequested();
 
-            if (entry.Key is null || entry.IsDirectory) continue;
+            if (item.Key is null || item.IsDirectory) continue;
 
-            string key = entry.Key.Replace('\\', '/');
+            string key = NormalizeTarKey(item.Key);
             string name = Path.GetFileName(key);
 
             bool nameOk = nameMatches(name);
 
             if (contentMatches == null)
             {
-                if (nameOk) found.Add(new ArchiveNode(name, key, false, entry.Size, entry.LastModifiedTime));
-                SkipEntryIfSolid(archive, entry);
+                if (nameOk) found.Add(new ArchiveNode(name, key, false, item.Size, item.LastModifiedTime));
+                SkipEntryIfSolid(archive, item);
                 continue;
             }
 
-            if (!nameOk || entry.Size > maxContentSize)
+            if (!nameOk || item.Size > maxContentSize)
             {
-                SkipEntryIfSolid(archive, entry);
+                SkipEntryIfSolid(archive, item);
                 continue;
             }
 
-            using var entryStream = entry.OpenEntryStream();
+            using var entryStream = item.OpenEntryStream();
 
-            bool hit = contentMatches(entryStream);
+            bool matched = contentMatches(entryStream);
 
             // The search may have stopped on the first matching line
             if (archive.IsSolid) entryStream.CopyTo(Stream.Null);
 
-            if (hit) found.Add(new ArchiveNode(name, key, false, entry.Size, entry.LastModifiedTime));
+            if (matched) found.Add(new ArchiveNode(name, key, false, item.Size, item.LastModifiedTime));
         }
 
         return found;
     }
+
+    private static DateTime? NullableTime(TarEntry entry) =>
+        entry.ModificationTime == default ? null : entry.ModificationTime.UtcDateTime;
 
     public static List<ArchiveNode> ListChildren(string archivePath, string subPath)
     {
@@ -305,37 +447,33 @@ public static class ArchiveService
         var folders = new Dictionary<string, ArchiveNode>(StringComparer.OrdinalIgnoreCase);
         var files = new List<ArchiveNode>();
 
-        using var stream = OpenArchiveStream(archivePath);
-        using var archive = ArchiveFactory.OpenArchive(stream);
-
-        foreach (var entry in archive.Entries)
+        foreach (var entry in GetIndex(archivePath).Entries)
         {
-            if (entry.Key is null) continue;
-            string key = entry.Key.Replace('\\', '/');
-
+            string key = entry.Key;
             if (prefix.Length > 0 && !key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
 
             string rest = key.Substring(prefix.Length).TrimStart('/');
-            if (rest.Length == 0) continue;
+            if (rest.Length == 0 || rest == "." || rest == "..") continue;
 
             int slash = rest.IndexOf('/');
             if (slash < 0)
             {
                 if (entry.IsDirectory)
-                    folders.TryAdd(rest, new ArchiveNode(rest, prefix + rest, true, 0, entry.LastModifiedTime));
+                    folders.TryAdd(rest, new ArchiveNode(rest, prefix + rest, true, 0, entry.Modified));
                 else
-                    files.Add(new ArchiveNode(rest, prefix + rest, false, entry.Size, entry.LastModifiedTime));
+                    files.Add(new ArchiveNode(rest, prefix + rest, false, entry.Size, entry.Modified));
             }
             else
             {
                 string folderName = rest.Substring(0, slash);
+                if (folderName.Length == 0 || folderName == "." || folderName == "..") continue;
                 folders.TryAdd(folderName, new ArchiveNode(folderName, prefix + folderName, true, 0, null));
             }
         }
 
-        var result = new List<ArchiveNode>();
-        result.AddRange(folders.Values.OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase));
-        result.AddRange(files.OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase));
+        var result = new List<ArchiveNode>(folders.Count + files.Count);
+        result.AddRange(folders.Values);
+        result.AddRange(files);
         return result;
     }
 
@@ -369,25 +507,54 @@ public static class ArchiveService
     {
         var wanted = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in keyToDestination)
-            wanted[pair.Key.Replace('\\', '/')] = pair.Value;
+            wanted[NormalizeTarKey(pair.Key)] = pair.Value;
 
         if (wanted.Count == 0) return 0;
 
         int written = 0;
 
+        if (IsCompressedTar(archivePath))
+        {
+            using var gzip = new GZipStream(OpenArchiveStream(archivePath), CompressionMode.Decompress);
+            using var tar = new TarReader(gzip);
+            TarEntry? entry;
+            // CRITICAL: copyData must be true for extraction, otherwise DataStream is null
+            while ((entry = tar.GetNextEntry(copyData: true)) != null)
+            {
+                if (IsTarDirectory(entry)) continue;
+
+                string key = NormalizeTarKey(entry.Name);
+                if (!wanted.TryGetValue(key, out string? destPath))
+                    continue;
+
+                wanted.Remove(key);
+
+                if (File.Exists(destPath) && confirmOverwrite != null && !confirmOverwrite(destPath))
+                {
+                    onProgress?.Invoke(Path.GetFileName(destPath), entry.Length, entry.Length);
+                    continue;
+                }
+
+                WriteTarEntry(entry, destPath, onProgress);
+                written++;
+            }
+
+            return written;
+        }
+
         using var stream = OpenArchiveStream(archivePath);
         using var archive = ArchiveFactory.OpenArchive(stream);
 
-        foreach (var entry in archive.Entries)
+        foreach (var item in archive.Entries)
         {
-            if (entry.Key is null || entry.IsDirectory) continue;
+            if (item.Key is null || item.IsDirectory) continue;
 
-            string key = entry.Key.Replace('\\', '/');
+            string key = NormalizeTarKey(item.Key);
 
             // If the file is not selected, we MUST safely skip it to keep solid archives in sync
             if (!wanted.TryGetValue(key, out string? destPath))
             {
-                SkipEntryIfSolid(archive, entry);
+                SkipEntryIfSolid(archive, item);
                 continue;
             }
 
@@ -395,11 +562,11 @@ public static class ArchiveService
 
             if (File.Exists(destPath) && confirmOverwrite != null && !confirmOverwrite(destPath))
             {
-                SkipEntryIfSolid(archive, entry);
+                SkipEntryIfSolid(archive, item);
 
                 // The totals were counted with this file in them, so the counters
                 // still have to move past it
-                onProgress?.Invoke(Path.GetFileName(destPath), entry.Size, entry.Size);
+                onProgress?.Invoke(Path.GetFileName(destPath), item.Size, item.Size);
 
                 // Only abort early if the archive is not solid. If it is solid,
                 // aborting is fine because we are destroying the decoder anyway.
@@ -407,7 +574,7 @@ public static class ArchiveService
                 continue;
             }
 
-            WriteEntry(entry, destPath, onProgress);
+            WriteEntry(item, destPath, onProgress);
             written++;
 
             if (wanted.Count == 0) break;
@@ -429,7 +596,7 @@ public static class ArchiveService
     private static string NormalizeDir(string subPath)
     {
         if (string.IsNullOrEmpty(subPath)) return "";
-        string s = subPath.Replace('\\', '/').Trim('/');
+        string s = NormalizeTarKey(subPath);
         return s.Length == 0 ? "" : s + "/";
     }
 
@@ -451,17 +618,28 @@ public static class ArchiveService
         using var entryStream = entry.OpenEntryStream();
         using var outFile = File.Create(destPath);
 
+        CopyEntryStream(entryStream, outFile, Path.GetFileName(destPath), entry.Size, onProgress);
+    }
+
+    private static void WriteTarEntry(TarEntry entry, string destPath, Action<string, long, long>? onProgress)
+    {
+        string? dir = Path.GetDirectoryName(destPath);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+        using var outFile = File.Create(destPath);
+        if (entry.DataStream != null)
+            CopyEntryStream(entry.DataStream, outFile, Path.GetFileName(destPath), entry.Length, onProgress);
+    }
+
+    private static void CopyEntryStream(
+        Stream entryStream, Stream outFile, string name, long total, Action<string, long, long>? onProgress)
+    {
         if (onProgress == null)
         {
             entryStream.CopyTo(outFile);
             return;
         }
 
-        string name = Path.GetFileName(destPath);
-        long total = entry.Size;
-
-        // Opens the file at zero, which is also what tells the caller a new file
-        // has started
         onProgress(name, 0, total);
 
         byte[] buffer = ArrayPool<byte>.Shared.Rent(ExtractBufferSize);
@@ -506,13 +684,13 @@ public static class ArchiveService
             int sep = normalized.IndexOf('\\', searchFrom);
             string candidate = sep < 0 ? normalized : normalized.Substring(0, sep);
 
-            if (ArchiveExtensions.Contains(Path.GetExtension(candidate)) || IsSelfExtracting(candidate))
+            if (IsArchiveFile(candidate))
             {
                 string internalPath = sep < 0
                     ? ""
                     : normalized.Substring(sep + 1).Replace('\\', '/');
 
-                return (candidate, internalPath);
+                return (candidate, NormalizeTarKey(internalPath));
             }
 
             if (sep < 0) return (null, fullPath);
@@ -525,32 +703,69 @@ public static class ArchiveService
         Func<string, bool>? confirmOverwrite = null, Action<string, long, long>? onProgress = null)
     {
         string prefix = NormalizeDir(subPath);
+
+        if (IsCompressedTar(archivePath))
+        {
+            using var gzip = new GZipStream(OpenArchiveStream(archivePath), CompressionMode.Decompress);
+            using var tar = new TarReader(gzip);
+            TarEntry? entry;
+            // CRITICAL: copyData must be true for extraction, otherwise DataStream is null
+            while ((entry = tar.GetNextEntry(copyData: true)) != null)
+            {
+                string key = NormalizeTarKey(entry.Name);
+                if (key.Length == 0) continue;
+                if (prefix.Length > 0 && !key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                string rest = key.Substring(prefix.Length).TrimStart('/');
+                if (rest.Length == 0) continue;
+
+                string destPath = SafeCombine(destDir, rest);
+
+                if (IsTarDirectory(entry))
+                {
+                    Directory.CreateDirectory(destPath);
+                    continue;
+                }
+
+                if (File.Exists(destPath) && confirmOverwrite != null && !confirmOverwrite(destPath))
+                {
+                    onProgress?.Invoke(Path.GetFileName(destPath), entry.Length, entry.Length);
+                    continue;
+                }
+
+                WriteTarEntry(entry, destPath, onProgress);
+            }
+
+            return;
+        }
+
         using var stream = OpenArchiveStream(archivePath);
         using var archive = ArchiveFactory.OpenArchive(stream);
 
-        foreach (var entry in archive.Entries)
+        foreach (var item in archive.Entries)
         {
-            if (entry.Key is null) continue;
+            if (item.Key is null) continue;
 
-            string key = entry.Key.Replace('\\', '/');
+            string key = NormalizeTarKey(item.Key);
 
             // Skip entries outside the requested folder safely
             if (prefix.Length > 0 && !key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             {
-                SkipEntryIfSolid(archive, entry);
+                SkipEntryIfSolid(archive, item);
                 continue;
             }
 
             string rest = key.Substring(prefix.Length).TrimStart('/');
             if (rest.Length == 0)
             {
-                SkipEntryIfSolid(archive, entry);
+                SkipEntryIfSolid(archive, item);
                 continue;
             }
 
             string destPath = SafeCombine(destDir, rest);
 
-            if (entry.IsDirectory)
+            if (item.IsDirectory)
             {
                 // Not reported: a folder is not one of the files the totals counted
                 Directory.CreateDirectory(destPath);
@@ -559,12 +774,12 @@ public static class ArchiveService
 
             if (File.Exists(destPath) && confirmOverwrite != null && !confirmOverwrite(destPath))
             {
-                SkipEntryIfSolid(archive, entry);
-                onProgress?.Invoke(Path.GetFileName(destPath), entry.Size, entry.Size);
+                SkipEntryIfSolid(archive, item);
+                onProgress?.Invoke(Path.GetFileName(destPath), item.Size, item.Size);
                 continue;
             }
 
-            WriteEntry(entry, destPath, onProgress);
+            WriteEntry(item, destPath, onProgress);
         }
     }
 }

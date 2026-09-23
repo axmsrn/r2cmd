@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.ComponentModel;
 using System.Windows.Media;
 
@@ -6,13 +6,49 @@ namespace R2Cmd;
 
 public sealed class FileEntry : INotifyPropertyChanged
 {
+    // =========================================================================
+    // Change notifications use shared, immutable event args. The size spinner
+    // raises two notifications per animating row ten times a second, and every
+    // one of them used to allocate a fresh PropertyChangedEventArgs.
+    // =========================================================================
+    private static readonly PropertyChangedEventArgs s_isCutChanged = new(nameof(IsCut));
+    private static readonly PropertyChangedEventArgs s_itemOpacityChanged = new(nameof(ItemOpacity));
+    private static readonly PropertyChangedEventArgs s_sizeChanged = new(nameof(Size));
+    private static readonly PropertyChangedEventArgs s_sizeKnownChanged = new(nameof(SizeKnown));
+    private static readonly PropertyChangedEventArgs s_sizeCalculatingChanged = new(nameof(SizeCalculating));
+    private static readonly PropertyChangedEventArgs s_sizeAnimationTextChanged = new(nameof(SizeAnimationText));
+    private static readonly PropertyChangedEventArgs s_sizeDisplayChanged = new(nameof(SizeDisplay));
+    private static readonly PropertyChangedEventArgs s_modifiedChanged = new(nameof(Modified));
+    private static readonly PropertyChangedEventArgs s_modifiedDisplayChanged = new(nameof(ModifiedDisplay));
+    private static readonly PropertyChangedEventArgs s_isMarkedChanged = new(nameof(IsMarked));
+    private static readonly PropertyChangedEventArgs s_iconChanged = new(nameof(Icon));
+    private static readonly PropertyChangedEventArgs s_isEditingChanged = new(nameof(IsEditing));
+
     public string Name { get; set; } = "";
     public string FullPath { get; set; } = "";
     public bool IsFolder { get; set; }
 
-    // New property for custom vector icons
+    // Custom vector icons for virtual items (SSH servers, network entries)
     public string IconType { get; set; } = "Default";
-    public DateTime? Modified { get; init; }
+
+    // =========================================================================
+    // Last write time. Settable and notifying, not init-only: the directory
+    // watcher must be able to update it when a file is saved in place. As an
+    // init property the pane kept the old time until the folder was re-read,
+    // even though the file on disk had changed.
+    // =========================================================================
+    private DateTime? _modified;
+    public DateTime? Modified
+    {
+        get => _modified;
+        set
+        {
+            if (_modified == value) return;
+            _modified = value;
+            OnPropertyChanged(s_modifiedChanged);
+            OnPropertyChanged(s_modifiedDisplayChanged);
+        }
+    }
 
     // Flag for hidden or system files
     public bool IsHidden { get; init; }
@@ -20,8 +56,22 @@ public sealed class FileEntry : INotifyPropertyChanged
     // Flag for symbolic links (shortcuts)
     public bool IsSymlink { get; init; }
 
-    // Lowers opacity to make the font look darker for hidden files
-    public double ItemOpacity => IsHidden ? 0.5 : 1.0;
+    // Flag for cut operation
+    private bool _isCut;
+    public bool IsCut
+    {
+        get => _isCut;
+        set
+        {
+            if (_isCut == value) return;
+            _isCut = value;
+            OnPropertyChanged(s_isCutChanged);
+            OnPropertyChanged(s_itemOpacityChanged);
+        }
+    }
+
+    // Lowers opacity to make the font look darker for hidden files or cut items
+    public double ItemOpacity => IsCut ? 0.5 : (IsHidden ? 0.5 : 1.0);
 
     // Fast check if the file is an archive (cached after first call to speed up XAML scrolling)
     private bool? _isArchive;
@@ -35,8 +85,8 @@ public sealed class FileEntry : INotifyPropertyChanged
         {
             if (_size == value) return;
             _size = value;
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Size)));
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SizeDisplay)));
+            OnPropertyChanged(s_sizeChanged);
+            OnPropertyChanged(s_sizeDisplayChanged);
         }
     }
 
@@ -48,8 +98,8 @@ public sealed class FileEntry : INotifyPropertyChanged
         {
             if (_sizeKnown == value) return;
             _sizeKnown = value;
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SizeKnown)));
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SizeDisplay)));
+            OnPropertyChanged(s_sizeKnownChanged);
+            OnPropertyChanged(s_sizeDisplayChanged);
         }
     }
 
@@ -61,13 +111,27 @@ public sealed class FileEntry : INotifyPropertyChanged
         {
             if (_sizeCalculating == value) return;
             _sizeCalculating = value;
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SizeCalculating)));
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SizeDisplay)));
+            OnPropertyChanged(s_sizeCalculatingChanged);
+            OnPropertyChanged(s_sizeDisplayChanged);
+        }
+    }
+
+    // Animated size text shown while a folder size is being calculated
+    private string _sizeAnimationText = "    ⠋    ";
+    public string SizeAnimationText
+    {
+        get => _sizeAnimationText;
+        set
+        {
+            if (_sizeAnimationText == value) return;
+            _sizeAnimationText = value;
+            OnPropertyChanged(s_sizeAnimationTextChanged);
+            OnPropertyChanged(s_sizeDisplayChanged);
         }
     }
 
     public string SizeDisplay => IsFolder
-        ? (SizeCalculating ? "…" : SizeKnown ? Helpers.FormatSize(Size) : "<DIR>")
+        ? (SizeCalculating ? SizeAnimationText : SizeKnown ? Helpers.FormatSize(Size) : "<DIR>")
         : Helpers.FormatSize(Size);
 
     public string ModifiedDisplay => Modified?.ToString("yyyy-MM-dd HH:mm") ?? "";
@@ -110,7 +174,7 @@ public sealed class FileEntry : INotifyPropertyChanged
         {
             if (_isMarked == value) return;
             _isMarked = value;
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsMarked)));
+            OnPropertyChanged(s_isMarkedChanged);
         }
     }
 
@@ -124,7 +188,7 @@ public sealed class FileEntry : INotifyPropertyChanged
         {
             if (ReferenceEquals(_icon, value)) return;
             _icon = value;
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Icon)));
+            OnPropertyChanged(s_iconChanged);
         }
     }
 
@@ -137,9 +201,11 @@ public sealed class FileEntry : INotifyPropertyChanged
         {
             if (_isEditing == value) return;
             _isEditing = value;
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsEditing)));
+            OnPropertyChanged(s_isEditingChanged);
         }
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
+
+    private void OnPropertyChanged(PropertyChangedEventArgs args) => PropertyChanged?.Invoke(this, args);
 }

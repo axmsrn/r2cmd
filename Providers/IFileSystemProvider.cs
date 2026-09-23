@@ -141,8 +141,8 @@ public class VirtualNetworkProvider : IFileSystemProvider
         // =====================================================================
         if (path.Equals(@"\\Network\LAN", StringComparison.OrdinalIgnoreCase))
         {
-            // [FIX]: Explicitly tell the UI that going up from LAN goes to \Network
-            entries.Add(new FileEntry { Name = "..", FullPath = @"\\Network", IsFolder = true });
+            // Оставляем FullPath пустым, чтобы MainWindow вызвал NavigateUpAsync
+            entries.Add(new FileEntry { Name = "..", IsFolder = true });
 
             try
             {
@@ -173,8 +173,8 @@ public class VirtualNetworkProvider : IFileSystemProvider
         // =====================================================================
         if (IsBareNetworkComputer(path))
         {
-            // [FIX]: Explicitly tell the UI that going up from a PC goes back to the LAN folder
-            entries.Add(new FileEntry { Name = "..", FullPath = @"\\Network\LAN", IsFolder = true });
+            // Оставляем FullPath пустым, чтобы MainWindow вызвал NavigateUpAsync
+            entries.Add(new FileEntry { Name = "..", IsFolder = true });
 
             var tcs = new TaskCompletionSource<bool>();
 
@@ -407,7 +407,8 @@ public class ArchiveProvider : IFileSystemProvider
         return Task.Run(() => File.Delete(file), ct);
     }
 }
-public class LocalDiskProvider : IFileSystemProvider
+// Must be marked partial to allow [LibraryImport] source generation
+public partial class LocalDiskProvider : IFileSystemProvider
 {
     private static readonly EnumerationOptions s_enumOptions = new()
     {
@@ -463,13 +464,17 @@ public class LocalDiskProvider : IFileSystemProvider
         });
     }
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    // EntryPoint is required: kernel32 exports only GetDiskFreeSpaceExA / ...ExW,
+    // and LibraryImport, unlike DllImport, does not look for the W version itself.
+    // Without it the call threw "Entry point was not found" and no free space
+    // was ever shown for a local drive.
+    [LibraryImport("kernel32.dll", EntryPoint = "GetDiskFreeSpaceExW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetDiskFreeSpaceEx(
-        string lpDirectoryName,
-        out ulong lpFreeBytesAvailable,
-        out ulong lpTotalNumberOfBytes,
-        out ulong lpTotalNumberOfFreeBytes);
+    private static partial bool GetDiskFreeSpaceEx(
+            string lpDirectoryName,
+            out ulong lpFreeBytesAvailable,
+            out ulong lpTotalNumberOfBytes,
+            out ulong lpTotalNumberOfFreeBytes);
 
     public ulong? GetFreeSpace(string path)
     {

@@ -44,8 +44,10 @@
 
     <Grid>
         <Grid.RowDefinitions>
-            <RowDefinition Height="*" />
-            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />          <!-- 0: Panes -->
+            <RowDefinition Height="Auto" />       <!-- 1: Horizontal Splitter -->
+            <RowDefinition x:Name="rowTerminal" Height="0" /> <!-- 2: Terminal Area -->
+            <RowDefinition Height="Auto" />       <!-- 3: StatusBar -->
         </Grid.RowDefinitions>
 
         <Grid Grid.Row="0">
@@ -72,7 +74,22 @@
             <controls:FilePaneControl x:Name="rightPane" Grid.Column="2" />
         </Grid>
 
-        <StatusBar Grid.Row="1">
+        <!-- Horizontal Splitter for Bottom Terminal -->
+        <GridSplitter x:Name="bottomTerminalSplitter" Grid.Row="1" Height="4"
+            HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+            ResizeDirection="Rows" ResizeBehavior="PreviousAndNext"
+            Focusable="False" Visibility="Collapsed"
+            Background="{DynamicResource Brush.Border}" />
+
+        <!-- Bottom Terminal Host -->
+        <Border x:Name="bottomTerminalHost" Grid.Row="2" Visibility="Collapsed"
+            BorderBrush="{DynamicResource Brush.Border}" BorderThickness="0,1,0,0">
+            <!-- Global Windows Terminal -->
+            <controls:TerminalControl x:Name="globalTerminal" Margin="4,0,4,4" />
+        </Border>
+
+        <!-- Main StatusBar -->
+        <StatusBar Grid.Row="3">
             <StatusBarItem>
                 <TextBlock x:Name="statusText" Text="Ready." />
             </StatusBarItem>
@@ -84,6 +101,7 @@
                 <TextBlock x:Name="backgroundText" Text="" Opacity="0.7"
                     Margin="16,0,0,0" />
             </StatusBarItem>
+
             <StatusBarItem HorizontalAlignment="Right">
                 <StackPanel Orientation="Horizontal">
                     <Button x:Name="btnSettings" Content="Editor" Click="OnSettingsClick"

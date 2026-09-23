@@ -19,28 +19,11 @@ public sealed class SshShellSession : ITerminalSession
 
     public SshShellSession(SshSession session, int cols, int rows)
     {
-        AuthenticationMethod authMethod;
-
-        if (session.AuthMethod == SshAuthMethod.PrivateKey)
+        // Same connection settings and retry as the file panes
+        _client = R2Cmd.Providers.SshFileSystemProvider.ConnectWithRetry(session, info => new SshClient(info)
         {
-            var keyFile = string.IsNullOrEmpty(session.Passphrase)
-                ? new PrivateKeyFile(session.PrivateKeyPath)
-                : new PrivateKeyFile(session.PrivateKeyPath, session.Passphrase);
-            authMethod = new PrivateKeyAuthenticationMethod(session.Username, keyFile);
-        }
-        else
-        {
-            authMethod = new PasswordAuthenticationMethod(session.Username, session.Password);
-        }
-
-        var connectionInfo = new ConnectionInfo(session.Host, session.Port, session.Username, authMethod)
-        {
-            Timeout = TimeSpan.FromSeconds(session.TimeoutSeconds)
-        };
-
-        _client = new SshClient(connectionInfo);
-        _client.KeepAliveInterval = TimeSpan.FromSeconds(30);
-        _client.Connect();
+            KeepAliveInterval = TimeSpan.FromSeconds(30)
+        });
 
         _shell = _client.CreateShellStream("xterm-256color", (uint)cols, (uint)rows, 800, 600, 65536);
 
@@ -62,12 +45,8 @@ public sealed class SshShellSession : ITerminalSession
                 if (!_client.IsConnected)
                     break;
 
-                if (!_shell.DataAvailable)
-                {
-                    Thread.Sleep(20);
-                    continue;
-                }
-
+                // The Read method blocks the thread natively until data arrives.
+                // This eliminates CPU polling overhead and provides instant terminal response.
                 int read = _shell.Read(buffer, 0, buffer.Length);
                 if (read <= 0) break;
 
@@ -96,35 +75,11 @@ public sealed class SshShellSession : ITerminalSession
 
         try
         {
-            // PROPER SSH RESIZE: We must send a "window-change" request out-of-band.
-            // Writing escape sequences to stdin (like \x1b[8;{rows};{cols}t) just types
-            // them into the shell, which breaks apps like Midnight Commander.
-
-            var shellType = _shell.GetType();
-
-            // Try to find the public method in modern SSH.NET versions
-            var method = shellType.GetMethod("SendWindowChangeRequest")
-                      ?? shellType.GetMethod("ChangeWindowSize");
-
-            if (method != null)
-            {
-                method.Invoke(_shell, new object[] { (uint)cols, (uint)rows, (uint)0, (uint)0 });
-            }
-            else
-            {
-                // Fallback for older SSH.NET versions: access the internal _channel via reflection
-                var channelField = shellType.GetField("_channel", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                if (channelField != null)
-                {
-                    var channel = channelField.GetValue(_shell);
-                    var channelMethod = channel?.GetType().GetMethod("SendWindowChangeRequest");
-
-                    // Parameters: uint columns, uint rows, uint width, uint height
-                    channelMethod?.Invoke(channel, new object[] { (uint)cols, (uint)rows, (uint)0, (uint)0 });
-                }
-            }
+            // Direct call for modern SSH.NET versions.
+            // No reflection needed, removing huge performance overhead during window resize.
+            _shell.ChangeWindowSize((uint)cols, (uint)rows, 0, 0);
         }
-        catch { /* connection lost or method not found */ }
+        catch { /* connection lost */ }
     }
 
     public void Dispose()
