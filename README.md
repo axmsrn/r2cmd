@@ -1,4 +1,4 @@
-# R2Cmd — Fast Dual-Pane File Manager for Windows
+# R2Cmd — Dual-Pane File Manager for Windows with SSH/SFTP
 
 [![License: Non-Commercial](https://img.shields.io/badge/License-Non--Commercial-red.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue.svg)](https://www.microsoft.com/windows)
