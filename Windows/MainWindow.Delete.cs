@@ -1,3 +1,4 @@
+// File: MainWindow.Delete.cs | Path: Windows/MainWindow.Delete.cs | Version: 2026-10-19.4
 using System.Collections.Concurrent;
 using System.IO;
 using System.IO.Enumeration;
@@ -16,6 +17,7 @@ public partial class MainWindow
     {
         try
         {
+            if (IsReparse(File.GetAttributes(path))) return;
             if (isDirectory)
             {
                 var di = new DirectoryInfo(path);
@@ -55,111 +57,35 @@ public partial class MainWindow
         IgnoreInaccessible = true
     };
 
+    // Pace of the row removal during a delete (see RemoveSomeRows)
+    private const int RowRemovalIntervalMs = 33;
+
+    // Catch-up share: a backlog is worked off over about this many ticks
+    private const int RowRemovalSpread = 6;
+
     private static bool IsReparse(FileAttributes attributes) =>
         (attributes & FileAttributes.ReparsePoint) != 0;
-
-    // =========================================================================
-    // Counts how many real files a selected entry represents, so the status bar
-    // can report "1234 / 7348 files" instead of "1 item" for a whole folder.
-    // Reparse points are never walked; an empty folder still counts as one unit.
-    //
-    // FileSystemEnumerable rather than DirectoryInfo.EnumerateFiles: the latter
-    // builds a full FileInfo per file only to be thrown away one line later.
-    // =========================================================================
-    private static int CountFilesForDelete(string path, bool isFolder, CancellationToken token)
-    {
-        if (path.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
-        {
-            try
-            {
-                var (files, _) = Providers.SshFileSystemProvider.RemoteSumTree(path);
-                return Math.Max(1, files);
-            }
-            catch { return 1; }
-        }
-
-        if (!isFolder) return 1;
-
-        try
-        {
-            var di = new DirectoryInfo(path);
-            if (IsReparse(di.Attributes)) return 1;
-
-            int count = 0;
-
-            var files = new FileSystemEnumerable<byte>(
-                path,
-                (ref FileSystemEntry entry) => 0,
-                s_recursiveEnumOptions)
-            {
-                ShouldIncludePredicate = (ref FileSystemEntry e) => !e.IsDirectory,
-                ShouldRecursePredicate = (ref FileSystemEntry e) => !IsReparse(e.Attributes)
-            };
-
-            foreach (var _ in files)
-            {
-                // Instant cancellation so ESC works during huge folder scans
-                token.ThrowIfCancellationRequested();
-                count++;
-            }
-
-            return Math.Max(1, count);
-        }
-        catch (OperationCanceledException) { throw; }
-        catch { return 1; }
-    }
 
     // What the delete loops do with a file they could not remove
     private enum FailureAction { Retry, Skip, Abort }
 
     // Called from background and STA threads; shows the dialog on the UI thread
     private delegate FailureAction FailureHandler(string path, string reason);
+    private delegate bool RecycleHandler(string path, out Exception? error);
+
+    // File.Exists/Directory.Exists also return false on access denial. That must
+    // never count as successful deletion or remove a protected item from the UI.
+    private static bool DeleteEntryExists(string path)
+    {
+        try { File.GetAttributes(path); return true; }
+        catch (FileNotFoundException) { return false; }
+        catch (DirectoryNotFoundException) { return false; }
+        catch { return true; }
+    }
 
     // The dialog names ten of them; collecting a hundred thousand strings from a
     // locked build folder would cost more than the operation itself
     private const int MaxCollectedErrors = 200;
-
-    // =========================================================================
-    // ONE STA THREAD PER OPERATION
-    //
-    // SHFileOperation needs an STA apartment. Spawning a fresh thread per chunk
-    // meant thousands of thread creations plus COM initialisation on a large
-    // delete, and the cost showed up as a visible stall between chunks. A single
-    // worker for the whole operation does the same job.
-    // =========================================================================
-    private sealed class StaWorker : IDisposable
-    {
-        private readonly BlockingCollection<(Action Work, TaskCompletionSource<bool> Done)> _queue = new();
-        private readonly Thread _thread;
-
-        public StaWorker()
-        {
-            _thread = new Thread(() =>
-            {
-                foreach (var (work, done) in _queue.GetConsumingEnumerable())
-                {
-                    try { work(); done.TrySetResult(true); }
-                    catch (Exception ex) { done.TrySetException(ex); }
-                }
-            })
-            { IsBackground = true };
-
-            _thread.SetApartmentState(ApartmentState.STA);
-            _thread.Start();
-        }
-
-        public Task RunAsync(Action work)
-        {
-            var done = new TaskCompletionSource<bool>();
-            _queue.Add((work, done));
-            return done.Task;
-        }
-
-        public void Dispose()
-        {
-            _queue.CompleteAdding();
-        }
-    }
 
     // =========================================================================
     // DELETE
@@ -198,7 +124,6 @@ public partial class MainWindow
         bool finished = false; // set once the delete loop is over, checked by queued UI updates
         int okItems = 0;       // top level entries removed
         int deletedFiles = 0;  // real files removed, shown in the status bar
-        int totalFiles = 0;    // result of the recursive pre-scan
         bool skipAllFailures = false;
         var errors = new List<string>();
 
@@ -206,7 +131,6 @@ public partial class MainWindow
         // real number of failures is counted separately. The summary used to
         // report errors.Count, so 5000 failures showed up as "Failed: 200".
         int failedCount = 0;
-        var fileCounts = new Dictionary<FileEntry, int>();
         string? itemToRestore = null;
 
         var deletedSet = new HashSet<FileEntry>(items);
@@ -242,8 +166,65 @@ public partial class MainWindow
         var totalTimeStopwatch = System.Diagnostics.Stopwatch.StartNew();
         IsStatusLocked = true;
 
+        // =====================================================================
+        // The folder watcher is paused while this delete owns the list.
+        // Otherwise it sees the Recycle Bin take 25 folders in one shell call
+        // and removes those rows itself in one chunk, ahead of the paced
+        // removal below: that was the remaining jerk. Resumed in finally.
+        // =====================================================================
+        var watcherPause = sourcePane.SuspendUpdatesScope();
+
         using var cts = new CancellationTokenSource();
-        using var sta = new StaWorker();
+        using var sta = new StaFileOperationWorker();
+        var elevatedOperations = new ElevatedFileOperations.Session(cts, request => Dispatcher.Invoke(() =>
+        {
+            string verb = permanent ? "permanently delete this item" : "move this item to the Recycle Bin";
+            var dialog = new ConfirmDialog(
+                $"Administrator permission is required for:\n{request.Source}\n\nContinue as administrator to {verb}?",
+                "Administrator permission") { Owner = this };
+            return dialog.ShowDialog() == true;
+        }));
+
+        // The UI remains free while the background delete/STA thread waits.
+        void WithDeleteElevation(Action action, string operation, string path) =>
+            elevatedOperations.RunAsync(action, new(operation, path, ""), !skipAllFailures).GetAwaiter().GetResult();
+
+        void DeleteLocal(string path, bool directory)
+        {
+            WithDeleteElevation(() =>
+            {
+                try
+                {
+                    if (directory) Directory.Delete(path, recursive: false);
+                    else File.Delete(path);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    ClearBlockingAttributes(path, directory);
+                    if (directory) Directory.Delete(path, recursive: false);
+                    else File.Delete(path);
+                }
+            }, directory ? "DeleteDirectory" : "DeleteFile", path);
+        }
+
+        bool TryRecycleLocal(string path, out Exception? error)
+        {
+            error = null;
+            try
+            {
+                WithDeleteElevation(() =>
+                {
+                    if (RecycleHelper.SendToRecycleBin(new[] { path }, silent: true, out var failure)) return;
+                    // Read-only attributes can be cleared without elevating.
+                    ClearBlockingAttributes(path, Directory.Exists(path));
+                    if (!RecycleHelper.SendToRecycleBin(new[] { path }, silent: true, out failure))
+                        throw failure ?? new IOException("Cannot move this item to the Recycle Bin.");
+                }, "Recycle", path);
+                return true;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { error = ex; return false; }
+        }
 
         KeyEventHandler cancelHandler = (s, e) =>
         {
@@ -282,8 +263,7 @@ public partial class MainWindow
                     string message =
                         $"{path}{Environment.NewLine}{Environment.NewLine}" +
                         $"{reason}{Environment.NewLine}{Environment.NewLine}" +
-                        "It is usually open in another program. Close it and press Retry, " +
-                        "or skip it and finish the rest.";
+                        "Resolve the problem and press Retry, or skip this item and finish the rest.";
 
                     var dialog = new ErrorActionDialog(
                         message,
@@ -322,82 +302,116 @@ public partial class MainWindow
 
         try
         {
-            // ---------------------------------------------------------------------
-            // PASS 1: count files so progress can be reported per file
-            //
-            // Skipped entirely for a selection of plain local files: the count is
-            // then the number of items, and the scan machinery costs more than the
-            // delete itself.
-            // ---------------------------------------------------------------------
-            bool needsScan = items.Any(i =>
-                i.IsFolder || i.FullPath.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase));
-
-            if (!needsScan)
-            {
-                foreach (var item in items) fileCounts[item] = 1;
-                totalFiles = items.Count;
-            }
-            else
-            {
-                SetStatus("Counting files to delete... [ESC to cancel]", forceUpdate: true);
-
-                try
-                {
-                    await Task.Run(() =>
-                    {
-                        foreach (var item in items)
-                        {
-                            cts.Token.ThrowIfCancellationRequested();
-                            int n = CountFilesForDelete(item.FullPath, item.IsFolder, cts.Token);
-                            fileCounts[item] = n;
-                            totalFiles += n;
-                        }
-                    }, cts.Token);
-                }
-                catch (OperationCanceledException) { }
-            }
-
-            if (cts.IsCancellationRequested)
-            {
-                SetStatus("Deletion canceled.");
-                return;
-            }
+            // =====================================================================
+            // No counting pass. It walked the whole tree once just to know the
+            // total for a progress bar, and on node_modules that walk took longer
+            // than the delete itself: a recycle is one shell call per batch, and
+            // a permanent delete reads the tree anyway. Progress now counts the
+            // selected items; within one big folder the deleted-file counter
+            // shows that work is going on.
+            // =====================================================================
+            int totalItems = items.Count;
 
             SetStatus(permanent
-                ? $"Deleting {totalFiles} file(s)... [ESC to cancel]"
-                : $"Moving {totalFiles} file(s) to Recycle Bin... [ESC to cancel]", forceUpdate: true);
+                ? $"Deleting {totalItems} item(s)... [ESC to cancel]"
+                : $"Moving {totalItems} item(s) to Recycle Bin... [ESC to cancel]", forceUpdate: true);
+
+            // Several items: the bar fills item by item. A single folder: its size
+            // is unknown without the scan, so the bar just shows activity.
+            // A single file is gone before a bar could be seen.
+            bool showBar = totalItems > 1 || items[0].IsFolder;
+            deleteProgress.IsIndeterminate = totalItems == 1;
+            deleteProgress.Value = 0;
+            deleteProgressItem.Visibility = showBar ? Visibility.Visible : Visibility.Collapsed;
 
             // ---------------------------------------------------------------------
             // PASS 2: delete
             // ---------------------------------------------------------------------
 
-            // Thread-safe unbounded channel for passing deleted entries to the UI thread
-            var uiChannel = System.Threading.Channels.Channel.CreateUnbounded<FileEntry>(
-                new System.Threading.Channels.UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+            // Deleted entries on their way to the UI thread. A plain concurrent
+            // queue: its Count is always supported, unlike a single-reader
+            // Channel, whose Count throws NotSupportedException
+            // ("Specified method is not supported").
+            var removedRows = new ConcurrentQueue<FileEntry>();
 
             // UI DispatcherTimer handles batch updates without flooding the Dispatcher queue
             var uiTimer = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Background)
             {
-                Interval = TimeSpan.FromMilliseconds(66)
+                Interval = TimeSpan.FromMilliseconds(RowRemovalIntervalMs)
             };
+
+            // =================================================================
+            // Rows leave the list at a steady pace, not in bursts.
+            //
+            // The Recycle Bin gets items in batches of 25 per shell call (one
+            // call each would be far slower), so they are reported done 25 at a
+            // time. Removing them all in one tick made the list jump every batch.
+            // Each tick now removes only a share of what is waiting; the deletion
+            // itself is not slowed down at all, only the display is spread out.
+            // =================================================================
+            // =================================================================
+            // Rows leave at the AVERAGE speed of the delete, not when a batch
+            // lands. A recycle batch of 25 folders reports nothing while the
+            // shell works and then all 25 at once; spreading them over a fixed
+            // 200 ms still left "burst, pause, burst". Paced by the measured
+            // rate, the list moves continuously, about one batch behind the
+            // disk. A growing backlog is caught up so it never lags further.
+            // =================================================================
+            var paceClock = System.Diagnostics.Stopwatch.StartNew();
+            double rowBudget = 0;
+
+            void RemoveSomeRows()
+            {
+                int waiting = removedRows.Count;
+                if (waiting == 0) { rowBudget = 0; return; }
+
+                double elapsedMs = Math.Max(1, paceClock.Elapsed.TotalMilliseconds);
+                int done = Volatile.Read(ref okItems);
+                bool deleteRunning = !Volatile.Read(ref finished);
+
+                // Rows per tick at the speed the delete has averaged so far
+                rowBudget += done * RowRemovalIntervalMs / elapsedMs;
+
+                // Catch up when more than two batches wait, and finish briskly
+                // once the delete itself is over
+                if (waiting > 50 || !deleteRunning) rowBudget += waiting / (double)RowRemovalSpread;
+
+                int take = Math.Min(waiting, (int)rowBudget);
+                if (take == 0) return;
+                rowBudget -= take;
+
+                for (int n = 0; n < take && removedRows.TryDequeue(out var rm); n++)
+                {
+                    if (sourcePane.CurrentPath == startingPath) sourcePane.Items.Remove(rm);
+                }
+            }
 
             uiTimer.Tick += (s, e) =>
             {
-                while (uiChannel.Reader.TryRead(out var rm))
+                // A display problem must never surface as an error dialog in
+                // the middle of a delete; it is reported in the status bar with
+                // the method that failed, so it can be traced
+                try
                 {
-                    if (sourcePane.CurrentPath == startingPath) sourcePane.Items.Remove(rm);
+                    RemoveSomeRows();
+                }
+                catch (Exception ex)
+                {
+                    SetStatus($"Row update error: {ex.GetType().Name} in {ex.TargetSite?.DeclaringType?.Name}.{ex.TargetSite?.Name}: {ex.Message}", forceUpdate: true);
                 }
 
                 if (!Volatile.Read(ref finished) && !cts.IsCancellationRequested)
                 {
                     int currentFiles = Volatile.Read(ref deletedFiles);
+                    int currentItems = Volatile.Read(ref okItems);
+                    if (totalItems > 1) deleteProgress.Value = Math.Min(100, currentItems * 100.0 / totalItems);
                     string timeElapsed = $"{totalTimeStopwatch.Elapsed.TotalSeconds:0.000}s";
                     bool isForeground = sourcePane.CurrentPath == startingPath && _activePane == sourcePane;
                     string escHint = isForeground ? " [ESC to cancel]" : " (Background)";
 
                     SetStatus(permanent
-                        ? $"Deleting... ({currentFiles} / {totalFiles} files) — Time: {timeElapsed}{escHint}"
-                        : $"Moving to Recycle Bin... ({currentFiles} / {totalFiles} files) — Time: {timeElapsed}{escHint}", forceUpdate: true);
+                        ? $"Deleting... {currentItems} / {totalItems} item(s), {currentFiles} file(s) — Time: {timeElapsed}{escHint}"
+                        : $"Moving to Recycle Bin... {currentItems} / {totalItems} item(s) — Time: {timeElapsed}{escHint}", forceUpdate: true);
                 }
             };
 
@@ -411,13 +425,12 @@ public partial class MainWindow
                 void MarkRemoved(FileEntry entry)
                 {
                     Interlocked.Increment(ref okItems);
-                    uiChannel.Writer.TryWrite(entry);
+                    removedRows.Enqueue(entry);
                 }
 
-                void CountFilesOf(FileEntry entry)
-                {
-                    Interlocked.Add(ref deletedFiles, fileCounts.TryGetValue(entry, out int n) ? n : 1);
-                }
+                // Without a pre-scan the files inside a folder removed in one call
+                // (a recycle, an SSH rm -r) are not known; the item counts as one
+                void CountFilesOf(FileEntry entry) => Interlocked.Increment(ref deletedFiles);
 
                 var recycleBatch = new List<FileEntry>(ChunkSize);
 
@@ -470,11 +483,11 @@ public partial class MainWindow
                             {
                                 Win32FastDeleteDirectory(item.FullPath,
                                     () => Interlocked.Increment(ref deletedFiles),
-                                    OnFailure, cts.Token);
+                                    OnFailure, cts.Token, DeleteLocal);
                             }
                             catch (OperationCanceledException) { canceled = true; }
 
-                            if (Directory.Exists(item.FullPath)) itemSuccess = false;
+                            if (DeleteEntryExists(item.FullPath)) itemSuccess = false;
                         }
                         else
                         {
@@ -482,22 +495,13 @@ public partial class MainWindow
                             {
                                 try
                                 {
-                                    File.Delete(item.FullPath);
+                                    DeleteLocal(item.FullPath, false);
                                     Interlocked.Increment(ref deletedFiles);
                                     break;
                                 }
+                                catch (OperationCanceledException) { canceled = true; itemSuccess = false; break; }
                                 catch (Exception ex)
                                 {
-                                    ClearBlockingAttributes(item.FullPath, isDirectory: false);
-
-                                    try
-                                    {
-                                        File.Delete(item.FullPath);
-                                        Interlocked.Increment(ref deletedFiles);
-                                        break;
-                                    }
-                                    catch { }
-
                                     var action = OnFailure(item.FullPath, ex.Message);
                                     if (action == FailureAction.Retry) continue;
                                     if (action == FailureAction.Abort) canceled = true;
@@ -534,7 +538,7 @@ public partial class MainWindow
                                 {
                                     if (cts.Token.IsCancellationRequested) { canceled = true; return; }
 
-                                    if (!File.Exists(item.FullPath) && !Directory.Exists(item.FullPath))
+                                    if (!DeleteEntryExists(item.FullPath))
                                     {
                                         CountFilesOf(item);
                                         MarkRemoved(item);
@@ -545,7 +549,7 @@ public partial class MainWindow
 
                                     while (!done)
                                     {
-                                        if (RecycleHelper.SendToRecycleBin(new[] { item.FullPath }, silent: true))
+                                        if (TryRecycleLocal(item.FullPath, out var recycleError))
                                         {
                                             CountFilesOf(item);
                                             MarkRemoved(item);
@@ -556,13 +560,13 @@ public partial class MainWindow
                                         {
                                             RecycleTreeContents(item.FullPath, OnFailure,
                                                 () => Interlocked.Increment(ref deletedFiles),
-                                                cts.Token);
+                                                cts.Token, TryRecycleLocal);
 
-                                            if (!Directory.Exists(item.FullPath)) MarkRemoved(item);
+                                            if (!DeleteEntryExists(item.FullPath)) MarkRemoved(item);
                                             break;
                                         }
 
-                                        var action = OnFailure(item.FullPath, "The file is open in another program or access is denied.");
+                                        var action = OnFailure(item.FullPath, recycleError?.Message ?? "Cannot move this item to the Recycle Bin.");
 
                                         switch (action)
                                         {
@@ -583,20 +587,30 @@ public partial class MainWindow
                 Volatile.Write(ref finished, true);
             });
 
+            // The rows still waiting leave at the same pace instead of all at
+            // once at the end; the timer keeps running until they are gone
+            while (!removedRows.IsEmpty && sourcePane.CurrentPath == startingPath)
+                await Task.Delay(RowRemovalIntervalMs);
+
             uiTimer.Stop();
 
-            // Final drain to ensure no items are left in the channel after the task finishes
-            while (uiChannel.Reader.TryRead(out var rm))
+            // Whatever is left (the user navigated away meanwhile)
+            while (removedRows.TryDequeue(out var rm))
             {
                 if (sourcePane.CurrentPath == startingPath) sourcePane.Items.Remove(rm);
             }
         }
         finally
         {
+            elevatedOperations.Dispose();
             this.PreviewKeyDown -= cancelHandler;
+
+            deleteProgressItem.Visibility = Visibility.Collapsed;
+            deleteProgress.IsIndeterminate = false;   // stops its animation timer
 
             totalTimeStopwatch.Stop();
             IsStatusLocked = false;
+            watcherPause.Dispose();
         }
 
         if (sourcePane.CurrentPath == startingPath)
@@ -617,7 +631,7 @@ public partial class MainWindow
 
         if (cts.IsCancellationRequested)
         {
-            SetStatus($"Deletion canceled. {deletedFiles} out of {totalFiles} file(s) deleted. — Time: {finalTimeElapsed}");
+            SetStatus($"Deletion canceled. {okItems} out of {items.Count} item(s) deleted. — Time: {finalTimeElapsed}");
         }
         else
         {
@@ -637,75 +651,60 @@ public partial class MainWindow
     //
     // Must run on an STA thread.
     // =========================================================================
-    private static void RecycleTreeContents(string path, FailureHandler onFailure, Action onFileRecycled, CancellationToken token)
+    private static void RecycleTreeContents(string path, FailureHandler onFailure, Action onFileRecycled,
+        CancellationToken token, RecycleHandler recycle)
     {
+        bool RecycleEntry(string entry)
+        {
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                if (!DeleteEntryExists(entry) || recycle(entry, out var error)) return true;
+                var action = onFailure(entry, error?.Message ?? "Cannot move this item to the Recycle Bin.");
+                if (action == FailureAction.Retry) continue;
+                if (action == FailureAction.Abort) throw new OperationCanceledException(token);
+                return false;
+            }
+        }
+
         try
         {
-            var files = Directory.GetFiles(path, "*", s_flatEnumOptions);
-
-            if (files.Length > 0)
+            token.ThrowIfCancellationRequested();
+            if (!DeleteEntryExists(path)) return;
+            // The selected root can itself be a junction, not only a child.
+            if (IsReparse(File.GetAttributes(path)))
             {
-                if (files.Length > 1 && RecycleHelper.SendToRecycleBin(files, silent: true))
-                {
-                    for (int i = 0; i < files.Length; i++) onFileRecycled();
-                }
-                else
-                {
-                    foreach (var file in files)
-                    {
-                        token.ThrowIfCancellationRequested();
+                RecycleEntry(path);
+                return;
+            }
 
-                        while (true)
-                        {
-                            if (RecycleHelper.SendToRecycleBin(new[] { file }, silent: true))
-                            {
-                                onFileRecycled();
-                                break;
-                            }
-
-                            // Read-only or hidden on its own is enough to be refused,
-                            // and clearing that needs no question
-                            ClearBlockingAttributes(file, isDirectory: false);
-
-                            if (RecycleHelper.SendToRecycleBin(new[] { file }, silent: true))
-                            {
-                                onFileRecycled();
-                                break;
-                            }
-
-                            var action = onFailure(file, "The file is open in another program or access is denied.");
-
-                            if (action == FailureAction.Retry) continue;
-                            if (action == FailureAction.Abort) throw new OperationCanceledException();
-                            break;
-                        }
-                    }
-                }
+            var files = Directory.GetFiles(path, "*", s_flatEnumOptions);
+            if (files.Length > 1 && RecycleHelper.SendToRecycleBin(files, silent: true))
+            {
+                for (int i = 0; i < files.Length; i++) onFileRecycled();
+            }
+            else
+            {
+                foreach (var file in files)
+                    if (RecycleEntry(file)) onFileRecycled();
             }
 
             foreach (var dir in Directory.GetDirectories(path, "*", s_flatEnumOptions))
             {
                 token.ThrowIfCancellationRequested();
-
-                // A junction is recycled as the link it is. Walking into it would
-                // empty the folder it points at.
-                if (IsReparse(File.GetAttributes(dir)))
-                {
-                    RecycleHelper.SendToRecycleBin(new[] { dir }, silent: true);
-                    continue;
-                }
-
-                RecycleTreeContents(dir, onFailure, onFileRecycled, token);
+                // Recycle a junction itself without walking into its target.
+                if (IsReparse(File.GetAttributes(dir))) RecycleEntry(dir);
+                else RecycleTreeContents(dir, onFailure, onFileRecycled, token, recycle);
             }
 
-            // Empty by now unless something inside was left behind
-            if (!Directory.EnumerateFileSystemEntries(path).Any())
-                RecycleHelper.SendToRecycleBin(new[] { path }, silent: true);
+            if (!Directory.EnumerateFileSystemEntries(path).Any()) RecycleEntry(path);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            onFailure(path, ex.Message);
+            var action = onFailure(path, ex.Message);
+            if (action == FailureAction.Abort) throw new OperationCanceledException(token);
+            if (action == FailureAction.Retry) RecycleTreeContents(path, onFailure, onFileRecycled, token, recycle);
         }
     }
 
@@ -725,84 +724,72 @@ public partial class MainWindow
     // and system files are never enumerated, never deleted, and the final
     // Directory.Delete fails because the folder still has content in it.
     // =========================================================================
-    private static void Win32FastDeleteDirectory(string path, Action? onFileDeleted, FailureHandler onFailure, CancellationToken token = default)
+    private static void Win32FastDeleteDirectory(string path, Action? onFileDeleted, FailureHandler onFailure,
+        CancellationToken token, Action<string, bool> deleteLocal)
     {
+        bool DeleteEntry(string entry, bool directory, bool reportedChildren = false)
+        {
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    deleteLocal(entry, directory);
+                    if (!directory) onFileDeleted?.Invoke();
+                    return true;
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    // A skipped child has already been reported by its full path.
+                    if (reportedChildren && ex.HResult == unchecked((int)0x80070091)) return false;
+                    var action = onFailure(entry, ex.Message);
+                    if (action == FailureAction.Retry) continue;
+                    if (action == FailureAction.Abort) throw new OperationCanceledException(token);
+                    return false;
+                }
+            }
+        }
+
         try
         {
+            token.ThrowIfCancellationRequested();
+            if (!DeleteEntryExists(path)) return;
+            if (IsReparse(File.GetAttributes(path)))
+            {
+                DeleteEntry(path, directory: true);
+                return;
+            }
+
             var entries = new FileSystemEnumerable<(string Path, FileAttributes Attributes, bool IsDirectory)>(
                 path,
                 (ref FileSystemEntry e) => (e.ToFullPath(), e.Attributes, e.IsDirectory),
                 s_flatEnumOptions).ToArray();
+            bool childrenLeft = false;
 
             foreach (var entry in entries)
             {
                 if (entry.IsDirectory) continue;
-
-                token.ThrowIfCancellationRequested();
-
-                while (true)
-                {
-                    try
-                    {
-                        File.Delete(entry.Path);
-                        onFileDeleted?.Invoke();
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        ClearBlockingAttributes(entry.Path, isDirectory: false);
-
-                        try
-                        {
-                            File.Delete(entry.Path);
-                            onFileDeleted?.Invoke();
-                            break;
-                        }
-                        catch { }
-
-                        var action = onFailure(entry.Path, ex.Message);
-
-                        if (action == FailureAction.Retry) continue;
-                        if (action == FailureAction.Abort) throw new OperationCanceledException();
-                        break;
-                    }
-                }
+                if (!DeleteEntry(entry.Path, directory: false)) childrenLeft = true;
             }
 
             foreach (var entry in entries)
             {
                 if (!entry.IsDirectory) continue;
-
                 token.ThrowIfCancellationRequested();
-
-                // A junction or symlink is removed as the link itself. Recursing
-                // into it would delete the contents of whatever it points at.
-                if (IsReparse(entry.Attributes))
-                {
-                    try { Directory.Delete(entry.Path, false); }
-                    catch (Exception ex) { onFailure(entry.Path, ex.Message); }
-                    continue;
-                }
-
-                Win32FastDeleteDirectory(entry.Path, onFileDeleted, onFailure, token);
+                if (IsReparse(entry.Attributes)) DeleteEntry(entry.Path, directory: true);
+                else Win32FastDeleteDirectory(entry.Path, onFileDeleted, onFailure, token, deleteLocal);
+                if (DeleteEntryExists(entry.Path)) childrenLeft = true;
             }
 
-            try { Directory.Delete(path, false); }
-            catch (UnauthorizedAccessException)
-            {
-                try
-                {
-                    ClearBlockingAttributes(path, isDirectory: true);
-                    Directory.Delete(path, false);
-                }
-                catch { /* not empty: something inside was left behind and reported */ }
-            }
-            catch { /* not empty: something inside was left behind and reported */ }
+            DeleteEntry(path, directory: true, reportedChildren: childrenLeft);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            onFailure(path, ex.Message);
+            var action = onFailure(path, ex.Message);
+            if (action == FailureAction.Abort) throw new OperationCanceledException(token);
+            if (action == FailureAction.Retry) Win32FastDeleteDirectory(path, onFileDeleted, onFailure, token, deleteLocal);
         }
     }
 
@@ -829,7 +816,11 @@ public partial class MainWindow
     // =========================================================================
     private void ShowSummary(string action, int files, int items, List<string> errors, int failed, string timeElapsed)
     {
-        string done = $"{action}: {files} file(s) in {items} item(s) done";
+        // A recycle removes whole folders in one shell call, so only the item
+        // count is real there; a permanent delete counts every file it removes
+        string done = action == "Recycle"
+            ? $"{action}: {items} item(s) done"
+            : $"{action}: {files} file(s) in {items} item(s) done";
 
         if (failed == 0)
         {

@@ -1,3 +1,4 @@
+// File: SshSession.cs | Path: Models/SshSession.cs | Version: 2026-10-19
 using System;
 using System.Text.Json.Serialization;
 
@@ -5,8 +6,9 @@ namespace R2Cmd;
 
 public enum SshAuthMethod
 {
-    Password,
-    PrivateKey
+    Password = 0,
+    PrivateKey = 1,
+    Agent = 2
 }
 
 public sealed class SshSession

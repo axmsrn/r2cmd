@@ -90,6 +90,18 @@
 
         <!-- Main StatusBar -->
         <StatusBar Grid.Row="3">
+            <!-- Delete progress. Delete has no window of its own (it runs in the
+                 background while the panes stay usable), so the bar lives here
+                 and is shown only while a deletion is running -->
+            <StatusBarItem x:Name="deleteProgressItem" Visibility="Collapsed">
+                <ProgressBar x:Name="deleteProgress" Width="140" Height="10"
+                    Minimum="0" Maximum="100" Margin="0,0,8,0"
+                    Background="{DynamicResource Brush.SurfaceAlt}"
+                    Foreground="{DynamicResource Brush.Accent}"
+                    BorderBrush="{DynamicResource Brush.Border}"
+                    BorderThickness="1" />
+            </StatusBarItem>
+
             <StatusBarItem>
                 <TextBlock x:Name="statusText" Text="Ready." />
             </StatusBarItem>

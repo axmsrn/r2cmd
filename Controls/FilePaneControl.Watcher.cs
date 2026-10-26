@@ -469,11 +469,10 @@ public partial class FilePaneControl
                     index?.Remove(path);
                     if (gone.IsMarked) marksChanged = true;
 
-                    // The cursor row itself went away: land on its neighbour,
-                    // which is what Explorer and Total Commander do
+                    // The cursor row itself went away: land on the row above it
                     if (ReferenceEquals(gone, selected))
                     {
-                        selected = Items.Count > 0 ? Items[Math.Min(slot, Items.Count - 1)] : null;
+                        selected = Items.Count > 0 ? Items[Math.Clamp(slot - 1, 0, Items.Count - 1)] : null;
                         selectionMoved = true;
                     }
                     break;
@@ -714,10 +713,6 @@ public partial class FilePaneControl
 
         if (lo != index) Items.Move(index, lo);
     }
-
-    // Kept for any caller outside this file
-    private bool BelongsToCurrentDir(string fullPath) =>
-        BelongsToDir(fullPath, CurrentPath.TrimEnd('\\', '/'));
 
     // Span based: GetDirectoryName on a string allocated a new string per event
     private static bool BelongsToDir(string fullPath, string normalizedDir)

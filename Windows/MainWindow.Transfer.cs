@@ -234,14 +234,15 @@ public partial class MainWindow
         EventHandler<string> onStatus = (s, text) => SetStatus(text, forceUpdate: true);
         dialog.StatusUpdated += onStatus;
 
-        var tcs = new TaskCompletionSource<bool>();
-        dialog.Closed += (s, e) => tcs.TrySetResult(true);
         dialog.BackgroundRequested += (s, e) => { this.IsEnabled = true; };
+
+        // Each item is unmarked as soon as it is done
+        dialog.ItemCompleted += entry => entry.IsMarked = false;
 
         try
         {
             dialog.Show();
-            await tcs.Task;
+            await dialog.Completion;
         }
         finally
         {
@@ -264,7 +265,9 @@ public partial class MainWindow
                 await onSuccess();
             }
 
-            sourcePane?.ClearSelection();
+            // No blanket ClearSelection here any more: finished items were
+            // unmarked one by one, and whatever is still marked failed, was
+            // skipped or was not reached before a cancel
         }
         finally
         {

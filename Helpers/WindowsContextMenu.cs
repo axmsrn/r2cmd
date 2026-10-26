@@ -40,15 +40,30 @@ public static class WindowsContextMenu
     }
 
     // Shows the menu for one path.
-    public static void Show(string? path, Window? ownerWindow)
+    public static bool Show(string? path, Window? ownerWindow)
     {
-        if (string.IsNullOrEmpty(path)) return;
-        Show(new[] { path }, ownerWindow);
+        if (string.IsNullOrEmpty(path)) return false;
+        return Show(new[] { path }, ownerWindow);
     }
+
+    // =========================================================================
+    // Commands after which the selection is still needed: the clipboard ones
+    // are followed by a paste, and Properties only looks. Canonical shell verbs,
+    // which do not depend on the Windows display language.
+    // =========================================================================
+    private static readonly HashSet<string> s_keepSelectionVerbs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "properties", "copy", "cut", "copyaspath"
+    };
 
     // Shows the menu for several items. All of them must live in the same folder —
     // that is how the shell context menu works; the parent is taken from the first one.
-    public static void Show(IEnumerable<string> paths, Window? ownerWindow)
+    //
+    // Returns true when a command that acts on the items was chosen (an archiver's
+    // "Add to archive", Delete, Send to, ...), so the caller can clear the marks,
+    // as it does after its own operations. The command itself usually runs in
+    // another process, so "chosen" is all that can be known, not "finished".
+    public static bool Show(IEnumerable<string> paths, Window? ownerWindow)
     {
         var list = paths?
             .Where(p => !string.IsNullOrEmpty(p))
@@ -57,7 +72,7 @@ public static class WindowsContextMenu
             .Select(p => p.Replace('/', '\\'))
             .ToList();
 
-        if (list == null || list.Count == 0) return;
+        if (list == null || list.Count == 0) return false;
 
         var fullPidls = new List<IntPtr>();
         var childPidls = new List<IntPtr>();
@@ -92,17 +107,17 @@ public static class WindowsContextMenu
                 }
             }
 
-            if (parentFolder == null || childPidls.Count == 0) return;
+            if (parentFolder == null || childPidls.Count == 0) return false;
 
             IntPtr hwnd = ownerWindow != null ? new WindowInteropHelper(ownerWindow).Handle : IntPtr.Zero;
 
             Guid iidIContextMenu = typeof(IContextMenu).GUID;
             parentFolder.GetUIObjectOf(hwnd, (uint)childPidls.Count, childPidls.ToArray(),
                                        ref iidIContextMenu, IntPtr.Zero, out contextMenu);
-            if (contextMenu == null) return;
+            if (contextMenu == null) return false;
 
             hMenu = CreatePopupMenu();
-            if (hMenu == IntPtr.Zero) return;
+            if (hMenu == IntPtr.Zero) return false;
 
             contextMenu.QueryContextMenu(hMenu, 0, CmdFirst, CmdLast, CMF_NORMAL | CMF_EXPLORE);
 
@@ -114,7 +129,10 @@ public static class WindowsContextMenu
 
             int cmd = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                        pt.X, pt.Y, msgWindow.Handle, IntPtr.Zero);
-            if (cmd <= 0) return;   // dismissed
+            if (cmd <= 0) return false;   // dismissed
+
+            // Read before invoking: some handlers release their state afterwards
+            string verb = GetVerb(contextMenu, (uint)(cmd - CmdFirst));
 
             var info = new CMINVOKECOMMANDINFO
             {
@@ -124,8 +142,14 @@ public static class WindowsContextMenu
                 nShow = SW_SHOWNORMAL
             };
             contextMenu.InvokeCommand(ref info);
+
+            return !s_keepSelectionVerbs.Contains(verb);
         }
-        catch { /* any shell failure — just show nothing */ }
+        catch
+        {
+            // any shell failure — just show nothing
+            return false;
+        }
         finally
         {
             msgWindow?.Dispose();
@@ -133,6 +157,27 @@ public static class WindowsContextMenu
             if (contextMenu != null) Marshal.ReleaseComObject(contextMenu);
             if (parentFolder != null) Marshal.ReleaseComObject(parentFolder);
             foreach (var p in fullPidls) if (p != IntPtr.Zero) Marshal.FreeCoTaskMem(p);
+        }
+    }
+
+    // The language-independent verb of a menu command ("copy", "properties").
+    // Third-party handlers often have none; that counts as acting on the items.
+    private static string GetVerb(IContextMenu menu, uint commandOffset)
+    {
+        const int capacity = 256;
+        IntPtr buffer = Marshal.AllocHGlobal(capacity * 2);
+        try
+        {
+            int hr = menu.GetCommandString(commandOffset, GCS_VERBW, 0, buffer, capacity);
+            return hr == 0 ? Marshal.PtrToStringUni(buffer) ?? "" : "";
+        }
+        catch
+        {
+            return "";
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
         }
     }
 
@@ -189,6 +234,7 @@ public static class WindowsContextMenu
     private const uint CmdLast = 0x7FFF;
     private const uint CMF_NORMAL = 0x00000000;
     private const uint CMF_EXPLORE = 0x00000004;
+    private const uint GCS_VERBW = 0x00000004;
     private const uint TPM_RETURNCMD = 0x0100;
     private const uint TPM_RIGHTBUTTON = 0x0002;
     private const int SW_SHOWNORMAL = 1;

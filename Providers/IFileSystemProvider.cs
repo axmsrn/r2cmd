@@ -338,7 +338,7 @@ public class ArchiveProvider : IFileSystemProvider
 
             try
             {
-                var nodes = ArchiveService.ListChildren(archivePath, internalPath);
+                var nodes = ArchiveService.ListChildren(archivePath, internalPath, ct);
                 foreach (var node in nodes)
                 {
                     if (ct.IsCancellationRequested) break;

@@ -1,4 +1,5 @@
-﻿using System;
+﻿// File: SshConnectionWindow.xaml.cs | Path: Dialogs/SshConnectionWindow.xaml.cs | Version: 2026-10-19
+using System;
 using System.Windows;
 using Microsoft.Win32;
 
@@ -22,7 +23,8 @@ public partial class SshConnectionWindow : Window
         pwdPassword.Password = s.Password;
         pwdPassphrase.Password = s.Passphrase;
 
-        if (s.AuthMethod == SshAuthMethod.PrivateKey) rbKey.IsChecked = true;
+        if (s.AuthMethod == SshAuthMethod.Agent) rbAgent.IsChecked = true;
+        else if (s.AuthMethod == SshAuthMethod.PrivateKey) rbKey.IsChecked = true;
         else rbPassword.IsChecked = true;
 
         UpdateAuthState();
@@ -40,8 +42,8 @@ public partial class SshConnectionWindow : Window
     private void UpdateAuthState()
     {
         bool key = rbKey.IsChecked == true;
-        // Password — for password auth; key path and passphrase — for key auth.
-        pwdPassword.IsEnabled = !key;
+        // Agent authentication uses neither a password nor a private key file.
+        pwdPassword.IsEnabled = rbPassword.IsChecked == true;
         txtKeyPath.IsEnabled = key;
         btnBrowse.IsEnabled = key;
         pwdPassphrase.IsEnabled = key;
@@ -92,7 +94,8 @@ public partial class SshConnectionWindow : Window
             Host = host,
             Port = port,
             Username = user,
-            AuthMethod = key ? SshAuthMethod.PrivateKey : SshAuthMethod.Password,
+            AuthMethod = rbAgent.IsChecked == true ? SshAuthMethod.Agent
+                : key ? SshAuthMethod.PrivateKey : SshAuthMethod.Password,
             Password = pwdPassword.Password,
             PrivateKeyPath = txtKeyPath.Text.Trim(),
             Passphrase = pwdPassphrase.Password,

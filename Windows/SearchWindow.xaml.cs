@@ -714,7 +714,7 @@ public partial class SearchWindow : Window
                     var sizeByPath = new Dictionary<string, long>(StringComparer.Ordinal);
                     try
                     {
-                        foreach (var (path, size) in Providers.SshFileSystemProvider.FindFiles(session, remote, masks, token))
+                        foreach (var (path, size) in Providers.SshFileSystemProvider.FindFiles(session, remote, masks, caseSensitive, token))
                         {
                             sizeByPath[path] = size;
 
@@ -723,6 +723,7 @@ public partial class SearchWindow : Window
                             sizeByPath[norm] = size;
                         }
                     }
+                    catch (OperationCanceledException) { throw; }
                     catch
                     {
                         // sizes stay 0 if find fails
@@ -764,7 +765,7 @@ public partial class SearchWindow : Window
                 else
                 {
                     // Name-only search → fast find with sizes (one server command)
-                    var foundPaths = Providers.SshFileSystemProvider.FindFiles(session, remote, masks, token);
+                    var foundPaths = Providers.SshFileSystemProvider.FindFiles(session, remote, masks, caseSensitive, token);
 
                     foreach (var (remoteFile, size) in foundPaths)
                     {

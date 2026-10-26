@@ -1,3 +1,4 @@
+<!-- File: SshConnectionWindow.xaml | Path: Dialogs/SshConnectionWindow.xaml | Version: 2026-10-19 -->
 <Window x:Class="R2Cmd.SshConnectionWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -51,12 +52,15 @@
 
         <TextBlock Grid.Row="3" Grid.Column="0" Text="Auth:" VerticalAlignment="Center"
             Margin="0,0,10,8" />
-        <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
+        <WrapPanel Grid.Row="3" Grid.Column="1" Margin="0,0,0,8">
             <RadioButton x:Name="rbPassword" GroupName="Auth" Content="Password"
                 VerticalAlignment="Center" Margin="0,0,20,0" Checked="AuthChanged" />
             <RadioButton x:Name="rbKey" GroupName="Auth" Content="Private key"
-                VerticalAlignment="Center" Checked="AuthChanged" />
-        </StackPanel>
+                VerticalAlignment="Center" Margin="0,0,20,0" Checked="AuthChanged" />
+            <RadioButton x:Name="rbAgent" GroupName="Auth" Content="SSH agent (Bitwarden)"
+                VerticalAlignment="Center" Checked="AuthChanged"
+                ToolTip="Enable SSH agent in the Bitwarden desktop app and approve the key request when connecting." />
+        </WrapPanel>
 
         <TextBlock Grid.Row="4" Grid.Column="0" Text="Password:" VerticalAlignment="Center"
             Margin="0,0,10,8" />

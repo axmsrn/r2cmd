@@ -1,3 +1,4 @@
+// File: TerminalControl.cs | Path: Terminal/TerminalControl.cs | Version: 2026-10-19
 using System;
 using System.Collections.Concurrent;
 using System.Globalization;
@@ -72,7 +73,7 @@ public sealed class TerminalControl : Control, IDisposable
 
     public event EventHandler? SessionExited;
 
-    public bool IsRunning => _startPending || _session?.IsRunning == true;
+    public bool IsRunning => _startPending || _pendingSshSession != null || _session?.IsRunning == true;
 
     public bool IsSshSession => _session is SshShellSession;
 
@@ -218,7 +219,7 @@ public sealed class TerminalControl : Control, IDisposable
 
     public void StartSsh(SshSession session)
     {
-        if (_session != null || _startPending) return;
+        if (_session != null || _startPending || _pendingSshSession != null) return;
         _pendingSshSession = session;
         _pendingWorkingDirectory = null;
         _pendingShellPath = null;
@@ -239,7 +240,9 @@ public sealed class TerminalControl : Control, IDisposable
 
         IsNetworkError = false;
         WriteLocal("\u001bc");
-        WriteLocal("Connecting to SSH...\r\n");
+        WriteLocal(_pendingSshSession.AuthMethod == SshAuthMethod.Agent
+            ? "Connecting to SSH via agent. Approve the key request in Bitwarden...\r\n"
+            : "Connecting to SSH...\r\n");
         InvalidateVisual();
 
         _lastTickTime = DateTime.UtcNow;
@@ -279,6 +282,10 @@ public sealed class TerminalControl : Control, IDisposable
                 {
                     error = ex;
 
+                    // The provider already retries network errors; never repeat agent approval or a rejected login.
+                    if (sessionInfo.AuthMethod == SshAuthMethod.Agent || ex is Renci.SshNet.Common.SshAuthenticationException)
+                        break;
+
                     // If the user closed the terminal window during the attempts, abort immediately
                     if (_pendingSshSession == null && _session == null) break;
                 }
@@ -295,6 +302,7 @@ public sealed class TerminalControl : Control, IDisposable
 
                 if (error != null || session == null)
                 {
+                    _pendingSshSession = null;
                     WriteLocal($"\r\n Cannot connect to SSH: {error?.Message ?? "unknown error"}\r\n");
                     InvalidateVisual();
                     try { session?.Dispose(); } catch { }
@@ -451,24 +459,6 @@ public sealed class TerminalControl : Control, IDisposable
         try
         {
             _session.Write(text);
-
-            if (text == "\x04" && IsSshSession)
-            {
-                System.Threading.Tasks.Task.Delay(500).ContinueWith(_ =>
-                {
-                    Dispatcher.BeginInvoke(new Action(() =>
-                    {
-                        if (_session != null)
-                        {
-                            IsNetworkError = true;
-                            WriteLocal("\r\n\r\n[Network error: Server did not respond to EOF]\r\n");
-                            Stop();
-                            SessionExited?.Invoke(this, EventArgs.Empty);
-                            Keyboard.ClearFocus();
-                        }
-                    }));
-                });
-            }
         }
         catch
         {

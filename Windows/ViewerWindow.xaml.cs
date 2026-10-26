@@ -82,6 +82,10 @@ public partial class ViewerWindow : Window
 
         SourceInitialized += (_, _) => Helpers.SetTitleBarTheme(this, ThemeManager.IsDarkTheme, useSurfaceColor: true);
 
+        // Static event: unsubscribed on close so a closed viewer can be collected
+        ThemeManager.ThemeChanged += OnThemeChanged;
+        Closed += (_, _) => ThemeManager.ThemeChanged -= OnThemeChanged;
+
         _scroller = new SmoothWheelScroller(Dispatcher);
         _scroller.Attach(avalonCodeViewer);
         _scroller.Attach(docViewer);
@@ -102,6 +106,26 @@ public partial class ViewerWindow : Window
 
     private static string GetHighlightingExtension(string path) =>
     AvalonEditDraculaTheme.GetHighlightingExtension(path);
+
+    // =========================================================================
+    // Theme switched while the viewer is open. The editor colours, the rendered
+    // Markdown and the title bar are set in code, so the current mode is simply
+    // loaded again: it applies all of them for the new theme. The scroll
+    // position is kept. An image has no themed content of its own.
+    // =========================================================================
+    private void OnThemeChanged(object? sender, EventArgs e)
+    {
+        if (TryFindResource("Brush.Background") is Brush background)
+            Resources[SystemColors.ControlBrushKey] = background;
+
+        Helpers.SetTitleBarTheme(this, ThemeManager.IsDarkTheme, useSurfaceColor: true);
+
+        if (_mode == ViewMode.Image) return;
+
+        double offset = avalonCodeViewer.VerticalOffset;
+        LoadFile();
+        avalonCodeViewer.ScrollToVerticalOffset(offset);
+    }
 
     private void LoadFile()
     {
@@ -218,7 +242,8 @@ public partial class ViewerWindow : Window
         }
 
         ResetMatches();
-        docViewer.Document = MarkdownRenderer.Render(content, Math.Max(13, FontSize));
+        // The file's own folder: relative images (screenshots/x.png) live next to it
+        docViewer.Document = MarkdownRenderer.Render(content, Math.Max(13, FontSize), Path.GetDirectoryName(_path));
         avalonCodeViewer.Visibility = Visibility.Collapsed;
         docViewer.Visibility = Visibility.Visible;
         ShowSurface(codeHost);
@@ -732,6 +757,14 @@ public partial class ViewerWindow : Window
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
         bool ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
+
+        // Ctrl+W closes the window (plain W toggles wrap)
+        if (ctrl && e.Key == Key.W)
+        {
+            e.Handled = true;
+            Close();
+            return;
+        }
 
         // Go to line by typing digits
         if (!txtFind.IsFocused && !ctrl)

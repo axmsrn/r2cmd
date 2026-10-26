@@ -403,7 +403,9 @@ public partial class FilePaneControl : UserControl
 
             Dispatcher.BeginInvoke(new Action(() =>
             {
-                WindowsContextMenu.Show(paths, owner);
+                // A command that acted on the items (an archiver, Delete, Send to)
+                // leaves them unmarked, like the application's own operations
+                if (WindowsContextMenu.Show(paths, owner)) ClearSelection();
             }), System.Windows.Threading.DispatcherPriority.ContextIdle);
 
             e.Handled = true;
@@ -449,15 +451,20 @@ public partial class FilePaneControl : UserControl
         }
     }
 
-    private void RestoreSelection(string? itemToSelect)
+    // fallbackIndex: the row to land on when itemToSelect no longer exists
+    private void RestoreSelection(string? itemToSelect, int fallbackIndex = 0)
     {
         FileEntry? match = null;
         if (!string.IsNullOrEmpty(itemToSelect))
-            match = Items.FirstOrDefault(e => string.Equals(e.Name, itemToSelect, StringComparison.OrdinalIgnoreCase));
+        {
+            match = Items.FirstOrDefault(e => string.Equals(e.Name, itemToSelect, StringComparison.Ordinal));
+            if (match == null && Providers.FileSystemFactory.GetProvider(CurrentPath) is Providers.LocalDiskProvider)
+                match = Items.FirstOrDefault(e => string.Equals(e.Name, itemToSelect, StringComparison.OrdinalIgnoreCase));
+        }
 
         if (match != null || Items.Count > 0)
         {
-            var target = match ?? Items[0];
+            var target = match ?? Items[Math.Clamp(fallbackIndex, 0, Items.Count - 1)];
             SetSelectedItem(target, takeFocus: lvFiles.IsKeyboardFocusWithin);
         }
     }

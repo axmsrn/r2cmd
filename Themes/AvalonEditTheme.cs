@@ -31,7 +31,7 @@ internal static class AvalonEditDraculaTheme
     internal static void Apply(TextEditor editor, string path, bool showLineNumbers)
     {
         editor.Background = (Brush)Application.Current.FindResource("Brush.Background");
-        editor.Foreground = DraculaPalette.ForegroundBrush;
+        editor.Foreground = DraculaPalette.GetForegroundBrush();
         editor.LineNumbersForeground = (Brush)Application.Current.FindResource("Brush.TextSecondary");
         editor.ShowLineNumbers = showLineNumbers;
         editor.TextArea.Background = (Brush)Application.Current.FindResource("Brush.Background");
@@ -40,7 +40,9 @@ internal static class AvalonEditDraculaTheme
         editor.TextArea.SelectionBrush = (Brush)Application.Current.FindResource("Brush.Selection");
         editor.TextArea.SelectionForeground = null;   // keep syntax colors when selected
         editor.TextArea.SelectionBorder = null;
-        editor.TextArea.Caret.CaretBrush = DraculaPalette.ForegroundBrush;
+        // Theme-aware: the dark palette's near-white caret was all but invisible
+        // on the light theme's background
+        editor.TextArea.Caret.CaretBrush = DraculaPalette.GetForegroundBrush();
         editor.TextArea.TextView.LinkTextForegroundBrush = ThemeManager.IsDarkTheme
             ? DraculaPalette.CyanBrush
             : DraculaPalette.LightCyanBrush;
@@ -57,8 +59,22 @@ internal static class AvalonEditDraculaTheme
                 break;
             }
         }
+        // =====================================================================
+        // One-time setup, done on the first Apply only. Apply runs again on
+        // every reload, encoding switch and mode switch; the SelectionChanged
+        // handler used to be added on each of those calls, so an editor that
+        // had been reloaded ten times ran the same handler ten times.
+        // =====================================================================
         if (!hasRenderer)
+        {
             textView.BackgroundRenderers.Add(new FullWidthSelectionRenderer(editor));
+
+            // Hide current-line highlight while there is a selection
+            editor.TextArea.SelectionChanged += (_, _) =>
+            {
+                editor.Options.HighlightCurrentLine = editor.TextArea.Selection.IsEmpty;
+            };
+        }
         editor.TextArea.TextView.Margin = new Thickness(6, 0, 0, 0);
         editor.Padding = new Thickness(4, 0, 0, 0);
 
@@ -75,11 +91,6 @@ internal static class AvalonEditDraculaTheme
         editor.TextArea.TextView.CurrentLineBackground = (Brush)Application.Current.FindResource("Brush.Surface");
         editor.TextArea.TextView.CurrentLineBorder = new Pen((Brush)Application.Current.FindResource("Brush.Border"), 1);
 
-        // Hide current-line highlight while there is a selection
-        editor.TextArea.SelectionChanged += (_, _) =>
-        {
-            editor.Options.HighlightCurrentLine = editor.TextArea.Selection.IsEmpty;
-        };
         editor.SyntaxHighlighting = CreateDefinition(path);
         MakeLineNumberSeparatorSolid(editor);
         editor.Dispatcher.BeginInvoke(() => MakeLineNumberSeparatorSolid(editor),
@@ -117,6 +128,17 @@ internal static class AvalonEditDraculaTheme
         return Path.GetExtension(path);
     }
 
+    // =========================================================================
+    // Recoloured definitions, one per language, theme and CSS extras.
+    //
+    // Each F3/F4, reload, encoding or mode switch used to parse the language's
+    // XSHD file from the AvalonEdit assembly again, rebuild the definition and,
+    // for CSS/HTML, compile two new regular expressions. The result depends
+    // only on these three inputs, so it is built once and shared by every
+    // editor. A theme switch simply produces a different key.
+    // =========================================================================
+    private static readonly Dictionary<(string Name, bool Dark, bool CssExtras), IHighlightingDefinition> s_definitions = new();
+
     private static IHighlightingDefinition? CreateDefinition(string path)
     {
         string extension = GetHighlightingExtension(path);
@@ -128,11 +150,24 @@ internal static class AvalonEditDraculaTheme
         if (definition == null)
             return null;
 
+        bool cssExtras = extension is ".css" or ".html" or ".htm";
+        var key = (definition.Name, ThemeManager.IsDarkTheme, cssExtras);
+
+        if (s_definitions.TryGetValue(key, out var cached))
+            return cached;
+
+        var built = BuildDefinition(definition, cssExtras);
+        s_definitions[key] = built;
+        return built;
+    }
+
+    private static IHighlightingDefinition BuildDefinition(IHighlightingDefinition definition, bool cssExtras)
+    {
         var freshDefinition = LoadFreshDefinition(definition.Name);
         if (freshDefinition == null)
             return definition;
 
-        if (extension is ".css" or ".html" or ".htm")
+        if (cssExtras)
         {
             AddRule(freshDefinition, "DraculaHexColor",
                 @"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})(?![0-9a-fA-F])",
@@ -268,10 +303,15 @@ internal static class AvalonEditDraculaTheme
             {
                 using var stream = assembly.GetManifestResourceStream(resourceName);
                 if (stream == null) continue;
+
+                // Only the root element's name attribute is needed. The old code
+                // parsed every embedded language file in full just to learn its
+                // name, which made the very first F3 noticeably slower.
                 using var reader = XmlReader.Create(stream);
-                var definition = HighlightingLoader.LoadXshd(reader);
-                if (!string.IsNullOrWhiteSpace(definition.Name))
-                    result[definition.Name] = resourceName;
+                reader.MoveToContent();
+                string? name = reader.GetAttribute("name");
+                if (!string.IsNullOrWhiteSpace(name))
+                    result[name] = resourceName;
             }
             catch
             {
@@ -377,10 +417,12 @@ internal static class AvalonEditDraculaTheme
 
             int hexEnd = Math.Min(60, text.Length);
 
-            var hexBrush = new SolidColorBrush(DraculaPalette.GetPurple());
-            hexBrush.Freeze();
+            // Shared frozen brushes and a span-based match: this runs for every
+            // visible line on every redraw, and used to create two brushes, a
+            // substring and a MatchCollection each time
+            var hexBrush = DraculaPalette.GetPurpleBrush();
 
-            foreach (Match match in HexWord.Matches(text.Substring(0, hexEnd)))
+            foreach (var match in HexWord.EnumerateMatches(text.AsSpan(0, hexEnd)))
             {
                 ChangeLinePart(
                     line.Offset + match.Index,
@@ -390,8 +432,7 @@ internal static class AvalonEditDraculaTheme
 
             if (text.Length > 60)
             {
-                var asciiBrush = new SolidColorBrush(DraculaPalette.GetComment());
-                asciiBrush.Freeze();
+                var asciiBrush = DraculaPalette.GetCommentBrush();
                 ChangeLinePart(
                     line.Offset + 60,
                     line.Offset + text.Length,

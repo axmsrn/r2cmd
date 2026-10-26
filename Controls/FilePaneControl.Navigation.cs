@@ -206,6 +206,10 @@ public partial class FilePaneControl
                     if (marked.Contains(entry.Name)) entry.IsMarked = true;
             }
 
+            // Where the cursor was, in case its file is gone after the reload
+            // (moved with F6, deleted elsewhere)
+            int oldIndex = isReload && lvFiles.SelectedItem is FileEntry current ? Items.IndexOf(current) : 0;
+
             Items.ReplaceAll(sorted);
             AutoSizeNameColumn();
 
@@ -217,7 +221,7 @@ public partial class FilePaneControl
             txtSpace.Text = "";
             _ = UpdateFreeSpaceAsync(provider, CurrentPath, token);
 
-            RestoreSelection(itemToSelect);
+            RestoreSelection(itemToSelect, oldIndex - 1);
 
             // Only now, once the folder has really been entered
             PathChanged?.Invoke(this, EventArgs.Empty);

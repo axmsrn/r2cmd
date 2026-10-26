@@ -1,8 +1,11 @@
+// File: SshFileSystemProvider.cs | Path: Providers/SshFileSystemProvider.cs | Version: 2026-10-26
 using System.Buffers;
 using System.IO;
 using System.Net.Sockets;
 using Renci.SshNet;
 using Renci.SshNet.Common;
+using Renci.SshNet.Sftp;
+using SshNet.Agent;
 
 namespace R2Cmd.Providers;
 
@@ -221,12 +224,6 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
             return _connections.TryGetValue(sessionName, out var conn) && IsLive(conn.Client);
     }
 
-    // Session names with a connection currently held open
-    public static List<string> ActiveSessions()
-    {
-        lock (_connections) return _connections.Keys.ToList();
-    }
-
     public static void CloseAll()
     {
         List<SshConnection> all;
@@ -323,35 +320,6 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         return parent.EndsWith('/') ? parent + name : parent + "/" + name;
     }
 
-    public static void DownloadToStream(string sshPath, Stream dest, CancellationToken ct, Action<int> onBytes)
-    {
-        var (session, remote) = SplitSshPath(sshPath);
-        var conn = RequireConnection(session);
-
-        conn.Enter(ct);
-        try
-        {
-            Stream src = OpenReadWithRetry(conn, remote);
-            using (src)
-            {
-                // Pooled: an 80 KB array per file lands on the large object heap
-                byte[] buffer = ArrayPool<byte>.Shared.Rent(TransferBufferSize);
-                try
-                {
-                    int n;
-                    while ((n = src.Read(buffer, 0, buffer.Length)) > 0)
-                    {
-                        ct.ThrowIfCancellationRequested();
-                        dest.Write(buffer, 0, n);
-                        onBytes(n);
-                    }
-                }
-                finally { ArrayPool<byte>.Shared.Return(buffer); }
-            }
-        }
-        finally { conn.Gate.Release(); }
-    }
-
     public static void UploadFromStream(Stream source, string sshPath, CancellationToken ct, Action<int> onBytes)
     {
         var (session, remote) = SplitSshPath(sshPath);
@@ -387,12 +355,6 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         return WithClient(session, c => { try { return c.Exists(remote); } catch { return false; } });
     }
 
-    public static bool RemoteIsDirectory(string sshPath)
-    {
-        var (session, remote) = SplitSshPath(sshPath);
-        return WithClient(session, c => { try { return c.GetAttributes(remote).IsDirectory; } catch { return false; } });
-    }
-
     // =========================================================================
     // Size and last write time of one remote entry, read with a single SFTP
     // stat. Remote folders have no watcher, so after the application itself
@@ -423,21 +385,6 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         WithClient<object?>(session, c => { CreateDirRecursive(c, remote); return null; });
     }
 
-    public static List<(string Name, bool IsDir, long Size)> RemoteList(string sshPath)
-    {
-        var (session, remote) = SplitSshPath(sshPath);
-        return WithClient(session, c =>
-        {
-            var list = new List<(string, bool, long)>();
-            foreach (var f in c.ListDirectory(remote))
-            {
-                if (f.Name is "." or "..") continue;
-                list.Add((f.Name, f.IsDirectory, f.IsDirectory ? 0 : f.Length));
-            }
-            return list;
-        });
-    }
-
     public static void RemoteDelete(string sshPath)
     {
         var (session, remote) = SplitSshPath(sshPath);
@@ -460,6 +407,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
     // =========================================================================
     public static (int Files, long Bytes) RemoteSumTree(string sshPath, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         var (session, remote) = SplitSshPath(sshPath);
 
         // =====================================================================
@@ -492,7 +440,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
 
         var conn = RequireConnection(session);
 
-        var root = WithClient(session, c => c.GetAttributes(remote));
+        var root = WithClient(session, c => c.GetAttributes(remote), ct);
         if (!root.IsDirectory) return (1, root.Size);
 
         int files = 0;
@@ -508,7 +456,11 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
             string dir = pending.Pop();
 
             // Anyone else waiting (a pane listing, F3, a copy) goes first
-            while (Volatile.Read(ref conn.Waiters) > 0) Thread.Sleep(10);
+            while (Volatile.Read(ref conn.Waiters) > 0)
+            {
+                ct.ThrowIfCancellationRequested();
+                Thread.Sleep(10);
+            }
 
             (List<string> Dirs, int Files, long Bytes) part;
             try
@@ -524,6 +476,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
 
                     foreach (var item in c.ListDirectory(dir))
                     {
+                        ct.ThrowIfCancellationRequested();
                         if (item.Name is "." or "..") continue;
 
                         if (item.IsDirectory) dirs.Add(RemoteCombine(dir, item.Name));
@@ -535,7 +488,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
                     }
 
                     return (dirs, f, b);
-                });
+                }, ct);
             }
             catch (SftpPermissionDeniedException)
             {
@@ -557,15 +510,17 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         return conn;
     }
 
-    private static T WithClient<T>(string sessionName, Func<SftpClient, T> action)
+    private static T WithClient<T>(string sessionName, Func<SftpClient, T> action, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         var conn = RequireConnection(sessionName);
-        conn.Enter();
+        conn.Enter(ct);
         try
         {
             try { return action(conn.Client); }
             catch (Exception ex) when (IsConnectionError(ex))
             {
+                ct.ThrowIfCancellationRequested();
                 Reconnect(conn);
                 return action(conn.Client);
             }
@@ -611,17 +566,30 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
 
     private static void DeleteRecursive(SftpClient c, string remote)
     {
-        var attrs = c.GetAttributes(remote);
-        if (attrs.IsDirectory)
+        string path = remote.TrimEnd('/');
+        string name = path[(path.LastIndexOf('/') + 1)..];
+        if (name.Length == 0 || name is "." or "..")
+            throw new IOException("Cannot delete the remote root or parent directory.");
+
+        // Get/GetAttributes/DeleteFile resolve REALPATH and can follow a link.
+        var entry = c.ListDirectory(RemoteParent(path)).FirstOrDefault(f => f.Name == name)
+            ?? throw new SftpPathNotFoundException("Remote item not found: " + remote);
+        DeleteRecursive(c, entry);
+    }
+
+    private static void DeleteRecursive(SftpClient c, ISftpFile entry)
+    {
+        if (entry.IsDirectory && !entry.IsSymbolicLink)
         {
-            foreach (var f in c.ListDirectory(remote))
+            foreach (var child in c.ListDirectory(entry.FullName))
             {
-                if (f.Name is "." or "..") continue;
-                DeleteRecursive(c, RemoteCombine(remote, f.Name));
+                if (child.Name is "." or "..") continue;
+                DeleteRecursive(c, child);
             }
-            c.DeleteDirectory(remote);
         }
-        else c.DeleteFile(remote);
+
+        // The listing entry deletes its own path without canonicalizing it.
+        entry.Delete();
     }
 
     private static (string Session, string Remote) SplitSshPath(string sshPath)
@@ -767,6 +735,14 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
                 client.Connect();
                 return client;
             }
+            // A declined or timed-out agent prompt must not trigger another prompt.
+            catch (Exception ex) when (session.AuthMethod == SshAuthMethod.Agent &&
+                (ex is SshAgentException or TimeoutException))
+            {
+                try { client.Dispose(); } catch { }
+                throw new SshAuthenticationException(
+                    "SSH agent could not authorize the connection. Unlock Bitwarden and approve the key request. " + ex.Message, ex);
+            }
             // A rejected key is never retried: the user said no
             catch (Exception ex) when (attempt < 2 && !keyRejected && ex is not SshAuthenticationException)
             {
@@ -813,8 +789,9 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         string host = $"{session.Host}:{session.Port}";
         string presented = $"{algorithm} SHA256:{fingerprint}";
 
-        var dispatcher = System.Windows.Application.Current?.Dispatcher;
-        if (dispatcher == null) return false;
+        var application = System.Windows.Application.Current;
+        if (application == null) return false;
+        var dispatcher = application.Dispatcher;
 
         bool onUiThread = dispatcher.CheckAccess();
         if (onUiThread ? !s_hostKeyPrompt.Wait(0) : !s_hostKeyPrompt.Wait(Timeout.Infinite)) return false;
@@ -844,7 +821,7 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
             {
                 var dialog = new ConfirmDialog(message, title)
                 {
-                    Owner = System.Windows.Application.Current.MainWindow
+                    Owner = application.MainWindow
                 };
                 return dialog.ShowDialog() == true;
             });
@@ -914,6 +891,31 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
                 ? new PrivateKeyFile(session.PrivateKeyPath)
                 : new PrivateKeyFile(session.PrivateKeyPath, session.Passphrase);
             auth = new PrivateKeyAuthenticationMethod(session.Username, keyFile);
+        }
+        else if (session.AuthMethod == SshAuthMethod.Agent)
+        {
+            // Bitwarden exposes the standard OpenSSH pipe on Windows.
+            // Allow time to unlock the vault and approve signing; private keys stay in the agent.
+            var agent = new SshAgent("openssh-ssh-agent", TimeSpan.FromMinutes(2));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(session.TimeoutSeconds));
+            IPrivateKeySource[] keys;
+            try
+            {
+                // Listing keys should finish within the normal connection timeout.
+                keys = agent.RequestIdentitiesAsync(timeout.Token).GetAwaiter().GetResult();
+            }
+            catch (Exception ex) when (ex is IOException or TimeoutException or SshAgentException
+                or OperationCanceledException or UnauthorizedAccessException)
+            {
+                throw new SshAuthenticationException(
+                    "Cannot access the SSH agent. Start Bitwarden desktop, enable SSH agent and unlock your vault.", ex);
+            }
+
+            if (keys.Length == 0)
+                throw new SshAuthenticationException(
+                    "The SSH agent returned no usable keys. Unlock Bitwarden and check that your SSH key is stored in the vault.");
+
+            auth = new PrivateKeyAuthenticationMethod(session.Username, keys);
         }
         else
         {
@@ -1081,20 +1083,11 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         string sessionName,
         string remoteDir,
         List<string> masks,
+        bool caseSensitive,
         CancellationToken ct = default)
     {
         var result = new List<(string Path, long Size)>();
-
-        var nameParts = new List<string>();
-        foreach (var mask in masks)
-        {
-            string escaped = mask.Replace("'", "'\\''");
-            nameParts.Add($"-name '{escaped}'");
-        }
-
-        string nameExpr = nameParts.Count == 1
-            ? nameParts[0]
-            : $@"\( {string.Join(" -o ", nameParts)} \)";
+        string nameExpr = FindNameExpression(masks, caseSensitive);
 
         string dir = remoteDir.Replace("'", "'\\''");
 
@@ -1150,6 +1143,18 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
 
         return result;
     }
+
+    private static string FindNameExpression(List<string> masks, bool caseSensitive)
+    {
+        string predicate = caseSensitive ? "-name" : "-iname";
+        var parts = masks.Select(mask => $"{predicate} '{mask.Replace("'", "'\\''")}'").ToArray();
+        return parts.Length switch
+        {
+            0 => "",
+            1 => parts[0],
+            _ => $@"\( {string.Join(" -o ", parts)} \)"
+        };
+    }
     /// <summary>
     /// Fast content search on the remote host using rg (ripgrep) or grep -r.
     /// Returns (remote path, match count) pairs.
@@ -1178,12 +1183,14 @@ public sealed class SshFileSystemProvider : IFileSystemProvider
         string regexFlag = isRegex ? "" : "-F";
 
         // -c = print count of matches per file
-        string globsRg = string.Join(" ", globArgs.Select(g => $"--glob '{g}'"));
+        string globFlag = caseSensitive ? "--glob" : "--iglob";
+        string globsRg = string.Join(" ", globArgs.Select(g => $"{globFlag} '{g}'"));
         // --count-matches = number of matches (not just matching lines)
         string rgCmd = $"rg --count-matches {caseFlag} {regexFlag} {globsRg} -- '{pat}' '{dir}' 2>/dev/null";
 
-        string includesGrep = string.Join(" ", globArgs.Select(g => $"--include='{g}'"));
-        string grepCmd = $"grep -rc {caseFlag} {regexFlag} {includesGrep} -- '{pat}' '{dir}' 2>/dev/null";
+        string grepRegexFlag = isRegex ? "-E" : "-F";
+        string nameExpr = FindNameExpression(masks, caseSensitive);
+        string grepCmd = $"find '{dir}' -type f {nameExpr} -exec grep -Hc {caseFlag} {grepRegexFlag} -- '{pat}' {{}} + 2>/dev/null";
 
         string? output = RunCommand(sessionName, rgCmd, ct);
         if (string.IsNullOrEmpty(output))

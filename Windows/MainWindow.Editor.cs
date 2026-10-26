@@ -315,7 +315,7 @@ public partial class MainWindow
         // would be overwritten by the download. So: send pending edits first,
         // then detach, then download.
         // =====================================================================
-        if (isSsh) await FlushAndStopRemoteEditAsync(GetTempCopyPath(item));
+        if (isSsh && !await FlushAndStopRemoteEditAsync(GetTempCopyPath(item))) return;
 
         // No SetBusy here: the wait cursor and the hotkey lock are not worth it
         // for a download that reports itself in the background status line
@@ -524,26 +524,30 @@ public partial class MainWindow
     }
 
     // Runs on the thread pool (timer callback) or from the exit flush
-    private async Task UploadIfChangedAsync(RemoteEditWatch watch, bool quiet)
+    private async Task<bool> UploadIfChangedAsync(RemoteEditWatch watch, bool quiet, bool stopOnSuccess = false)
     {
-        if (watch.Stopped) return;
+        if (watch.Stopped) return false;
 
         await watch.Gate.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (watch.Stopped) return;
+            if (watch.Stopped) return false;
 
             // Mid atomic-save the file can be briefly missing; the Created or
             // Renamed event of the new file restarts the timer
             var info = new FileInfo(watch.LocalPath);
-            if (!info.Exists) return;
+            if (!info.Exists) return false;
 
             // Captured BEFORE reading: if the editor saves again during the
             // upload, the stamp no longer matches and the next event sends it
             long length = info.Length;
             DateTime writeUtc = info.LastWriteTimeUtc;
 
-            if (length == watch.SyncedLength && writeUtc == watch.SyncedWriteUtc) return;
+            if (length == watch.SyncedLength && writeUtc == watch.SyncedWriteUtc)
+            {
+                if (stopOnSuccess) StopWatch(watch);
+                return true;
+            }
 
             string name = Path.GetFileName(watch.RemotePath);
             if (!quiet) PostStatus($"Uploading changes to {name}...");
@@ -562,6 +566,10 @@ public partial class MainWindow
                 if (!Dispatcher.HasShutdownStarted)
                     _ = Dispatcher.InvokeAsync(() => RefreshRemoteEntry(watch.RemotePath));
             }
+
+            // Stop while holding the gate, before another queued upload can run.
+            if (stopOnSuccess) StopWatch(watch);
+            return true;
         }
         catch (Exception ex)
         {
@@ -573,6 +581,7 @@ public partial class MainWindow
                     "Save the file again in the editor to retry.",
                     "SSH Upload Error"));
             }
+            return false;
         }
         finally
         {
@@ -602,13 +611,14 @@ public partial class MainWindow
     }
 
     // Detaches the watch for a local copy, sending any saved-but-unsent edit first
-    private async Task FlushAndStopRemoteEditAsync(string localPath)
+    private async Task<bool> FlushAndStopRemoteEditAsync(string localPath)
     {
-        if (!_remoteEdits.Remove(localPath, out var watch)) return;
+        if (!_remoteEdits.TryGetValue(localPath, out var watch)) return true;
 
-        DetachEvents(watch);
-        await UploadIfChangedAsync(watch, quiet: false);
-        StopWatch(watch);
+        if (!await UploadIfChangedAsync(watch, quiet: false, stopOnSuccess: true)) return false;
+
+        _remoteEdits.Remove(localPath);
+        return true;
     }
 
     // Stops events and the pending timer; no further upload can be scheduled

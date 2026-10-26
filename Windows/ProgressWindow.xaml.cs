@@ -1,3 +1,4 @@
+// File: ProgressWindow.xaml.cs | Path: Windows/ProgressWindow.xaml.cs | Version: 2026-10-26
 using System;
 using System.Buffers;
 using System.Collections.Generic;
@@ -35,6 +36,10 @@ public partial class ProgressWindow : Window
     private readonly string _destination; // target folder, or the .zip path when packing
     private readonly FileOperation _operation;
     private readonly CancellationTokenSource _cts = new();
+    private readonly ElevatedFileOperations.Session _elevatedOperations;
+    private readonly TaskCompletionSource<bool> _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task Completion => _completion.Task;
 
     // Timer for the whole operation
     private readonly System.Diagnostics.Stopwatch _operationStopwatch = new();
@@ -103,6 +108,18 @@ public partial class ProgressWindow : Window
     }
     public IReadOnlyList<FileEntry> FullyPackedItems => _fullyPacked;
 
+    // =========================================================================
+    // Raised on the UI thread for every selected item the moment it is done
+    // without a skip or an error, so the panel can unmark it right away, the
+    // way Total Commander does. Marks used to disappear all at once at the end.
+    // Items that failed, were skipped or were never reached (cancel) are not
+    // reported and stay marked: that is exactly what still needs attention.
+    // =========================================================================
+    public event Action<FileEntry>? ItemCompleted;
+
+    private void ReportItemCompleted(FileEntry item) =>
+        Dispatcher.InvokeAsync(() => ItemCompleted?.Invoke(item));
+
     public bool IsCancelled { get; private set; } = false;
     public int SuccessfullyProcessedFiles { get; private set; } = 0;
 
@@ -144,6 +161,7 @@ public partial class ProgressWindow : Window
         _sourceItems = sourceItems;
         _destination = destination;
         _operation = operation;
+        _elevatedOperations = new ElevatedFileOperations.Session(_cts, ConfirmElevation);
         this.ShowInTaskbar = false;
 
         Title = _operation switch
@@ -198,7 +216,10 @@ public partial class ProgressWindow : Window
 
         try
         {
-            await RunOperationAsync();
+            using (_elevatedOperations)
+            {
+                await RunOperationAsync();
+            }
         }
         catch (OperationCanceledException)
         {
@@ -206,13 +227,14 @@ public partial class ProgressWindow : Window
         }
         catch (Exception ex)
         {
-            MessageDialog.Show(this, $"Critical Error: {ex.Message}", "Error");
             IsCancelled = true;
+            MessageDialog.Show(this, $"Critical Error: {ex.Message}", "Error");
         }
         finally
         {
             // Stop the timer when the operation is completely done or canceled
             _operationStopwatch.Stop();
+            _completion.TrySetResult(true);
             Close();
         }
     }
@@ -243,13 +265,18 @@ public partial class ProgressWindow : Window
         {
             btnCancel.IsEnabled = false;
             btnCancel.Content = "Canceling...";
+            IsCancelled = true;
             _cts.Cancel();
         }
     }
 
     private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
     {
-        if (btnCancel.IsEnabled) _cts.Cancel();
+        if (_completion.Task.IsCompleted) return;
+
+        // Keep the window alive until cancellation and archive finalization finish.
+        e.Cancel = true;
+        CancelOperation();
     }
 
     // Both logical and keyboard focus, deferred so it survives window activation
@@ -280,11 +307,11 @@ public partial class ProgressWindow : Window
         FocusCancelButton();
     }
 
-    private void HandleErrorDecision(string sourcePath, Exception ex, string title)
+    private void HandleErrorDecision(string sourcePath, Exception ex, string title, long? skippedBytes = null)
     {
         if (_skipAllErrors)
         {
-            UpdateTotalProgressOnSkip(sourcePath);
+            UpdateTotalProgressOnSkip(sourcePath, skippedBytes);
             return;
         }
 
@@ -306,7 +333,7 @@ public partial class ProgressWindow : Window
 
         if (choice == ErrorChoice.SkipAll) _skipAllErrors = true;
 
-        UpdateTotalProgressOnSkip(sourcePath);
+        UpdateTotalProgressOnSkip(sourcePath, skippedBytes);
     }
 
     private async Task RunOperationAsync()
@@ -357,29 +384,46 @@ public partial class ProgressWindow : Window
         // =========================================================================
         await Task.Run(async () =>
         {
-            var archivesDone = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Archive path -> whether its group extraction went through cleanly
+            var archivesDone = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var step in plan.Steps)
             {
                 _cts.Token.ThrowIfCancellationRequested();
 
+                // A skip or error anywhere inside this item raises the counter
+                int skippedBefore = _skipCount;
+                bool clean;
+
                 switch (step.Kind)
                 {
                     case PlanKind.Normal:
                         await ProcessEntryUniversalAsync(step.Item.FullPath, step.TargetPath, step.Item.IsFolder);
+                        clean = _skipCount == skippedBefore;
                         break;
 
                     case PlanKind.ArchiveFolder:
-                        ExtractArchiveFolder(step, destProvider);
+                        await ExtractArchiveFolderAsync(step, destProvider);
+                        clean = _skipCount == skippedBefore;
                         break;
 
                     case PlanKind.ArchiveFile:
                         // The whole group leaves with the first of its files; the
                         // rest are already covered by that single pass
-                        if (archivesDone.Add(step.ArchivePath!))
-                            ExtractArchiveFileGroup(step.ArchivePath!, plan.FileGroups[step.ArchivePath!]);
+                        if (!archivesDone.TryGetValue(step.ArchivePath!, out clean))
+                        {
+                            await ExtractArchiveFileGroupAsync(step.ArchivePath!, plan.FileGroups[step.ArchivePath!], destProvider);
+                            clean = _skipCount == skippedBefore;
+                            archivesDone[step.ArchivePath!] = clean;
+                        }
+                        break;
+
+                    default:
+                        clean = false;
                         break;
                 }
+
+                if (clean) ReportItemCompleted(step.Item);
             }
         });
     }
@@ -422,6 +466,7 @@ public partial class ProgressWindow : Window
             }
 
             _movedByRename++;
+            ReportItemCompleted(item);
             _totalFiles++;
             _copiedFiles++;
             SuccessfullyProcessedFiles++;
@@ -467,6 +512,7 @@ public partial class ProgressWindow : Window
     {
         var steps = new List<PlanStep>(items.Count);
         var fileGroups = new Dictionary<string, List<PlanStep>>(StringComparer.OrdinalIgnoreCase);
+        var localTargets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var item in items)
         {
@@ -485,8 +531,8 @@ public partial class ProgressWindow : Window
                 continue;
             }
 
-            if (destProvider is not LocalDiskProvider)
-                throw new InvalidOperationException("Extracting archives directly to remote servers is not supported yet.");
+            if (destProvider is LocalDiskProvider)
+                ArchiveService.RegisterLocalDestination(targetPath, localTargets);
 
             if (item.IsFolder)
             {
@@ -507,14 +553,35 @@ public partial class ProgressWindow : Window
     }
 
     // A whole folder out of an archive is already a single pass
-    private void ExtractArchiveFolder(PlanStep step, IFileSystemProvider destProvider)
+    private async Task ExtractArchiveFolderAsync(PlanStep step, IFileSystemProvider destProvider)
     {
         UpdateUi($"Extracting: {step.Item.Name}", 0, 0, force: false);
+
+        if (destProvider is not LocalDiskProvider)
+        {
+            var directories = new HashSet<string>(StringComparer.Ordinal);
+            var folder = new ArchiveNode(step.Item.Name, step.InternalPath!, true, 0, null);
+            if (!await TransferArchiveEntryAsync(step.ArchivePath!, folder, null,
+                step.TargetPath, "", destProvider, directories)) return;
+
+            int filesBefore = SuccessfullyProcessedFiles;
+            string prefix = step.InternalPath!.TrimEnd('/') + "/";
+            await foreach (var (node, content) in ArchiveService.ReadEntriesAsync(step.ArchivePath!,
+                node => node.FullKey.StartsWith(prefix, StringComparison.Ordinal), _cts.Token))
+            {
+                await TransferArchiveEntryAsync(step.ArchivePath!, node, content,
+                    step.TargetPath, node.FullKey.Substring(prefix.Length), destProvider, directories);
+            }
+
+            // Refresh the destination pane even when the selected folder was empty.
+            if (SuccessfullyProcessedFiles == filesBefore) SuccessfullyProcessedFiles++;
+            return;
+        }
 
         destProvider.CreateDirectory(step.TargetPath);
 
         ArchiveService.ExtractFolder(step.ArchivePath!, step.InternalPath!, step.TargetPath,
-            ConfirmArchiveOverwrite, MakeArchiveProgress());
+            ConfirmArchiveOverwrite, MakeArchiveProgress(), _cts.Token);
 
         SuccessfullyProcessedFiles++;
     }
@@ -550,16 +617,39 @@ public partial class ProgressWindow : Window
     }
 
     // Every file selected from one archive, in one pass over it
-    private void ExtractArchiveFileGroup(string archivePath, List<PlanStep> group)
+    private async Task ExtractArchiveFileGroupAsync(string archivePath, List<PlanStep> group, IFileSystemProvider destProvider)
     {
         UpdateUi($"Extracting {group.Count} file(s) from {Path.GetFileName(archivePath)}...", 0, 0, force: true);
 
+        if (destProvider is not LocalDiskProvider)
+        {
+            var remaining = new Dictionary<string, PlanStep>(StringComparer.Ordinal);
+            foreach (var step in group) remaining[step.InternalPath!] = step;
+            var directories = new HashSet<string>(StringComparer.Ordinal);
+
+            await foreach (var (node, content) in ArchiveService.ReadEntriesAsync(archivePath,
+                node => !node.IsFolder && remaining.ContainsKey(node.FullKey), _cts.Token))
+            {
+                var step = remaining[node.FullKey];
+                remaining.Remove(node.FullKey);
+                await TransferArchiveEntryAsync(archivePath, node, content,
+                    _destination, step.Item.Name, destProvider, directories);
+                if (remaining.Count == 0) break;
+            }
+
+            foreach (var step in remaining.Values)
+                HandleErrorDecision(step.Item.FullPath,
+                    new FileNotFoundException("Entry not found in archive: " + step.InternalPath),
+                    "Transfer Error", step.Item.Size);
+            return;
+        }
+
         // Built by hand rather than with ToDictionary: the same entry selected
         // twice would throw there
-        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var step in group) map[step.InternalPath!] = step.TargetPath;
 
-        int written = ArchiveService.ExtractFiles(archivePath, map, ConfirmArchiveOverwrite, MakeArchiveProgress());
+        int written = ArchiveService.ExtractFiles(archivePath, map, ConfirmArchiveOverwrite, MakeArchiveProgress(), _cts.Token);
 
         SuccessfullyProcessedFiles += written;
 
@@ -569,6 +659,71 @@ public partial class ProgressWindow : Window
             _anythingSkipped = true;
             _skipCount += map.Count - written;
         }
+    }
+
+    // Archive streams are consumed here directly; SSH authentication and stream
+    // lifetime remain the responsibility of the existing destination provider.
+    private async Task<bool> TransferArchiveEntryAsync(string archivePath, ArchiveNode node, Stream? content,
+        string destinationRoot, string relativePath, IFileSystemProvider destProvider, HashSet<string> directories)
+    {
+        _cts.Token.ThrowIfCancellationRequested();
+        string sourcePath = archivePath + "\\" + node.FullKey.Replace('/', '\\');
+        long bytesBefore = _copiedBytes;
+
+        try
+        {
+            string targetPath = CombineArchiveTarget(destProvider, destinationRoot, relativePath);
+            if (node.IsFolder)
+            {
+                EnsureArchiveDirectory(destProvider, targetPath, directories);
+                return true;
+            }
+
+            if (destProvider.Exists(targetPath) && !ResolveOverwriteDecision(node.Name))
+            {
+                UpdateTotalProgressOnSkip(sourcePath, node.Size);
+                return false;
+            }
+
+            EnsureArchiveDirectory(destProvider, destProvider.GetParentPath(targetPath), directories);
+            if (content == null) throw new InvalidDataException("Archive entry has no content stream: " + node.FullKey);
+
+            await using (Stream target = await destProvider.OpenWriteAsync(targetPath, _cts.Token))
+                await CopyStreamAsync(content, target, node.Name, node.Size);
+
+            _copiedFiles++;
+            SuccessfullyProcessedFiles++;
+            UpdateUi(node.Name, node.Size, node.Size, force: false);
+            return true;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            // Bytes already sent by a failed attempt must not be counted again
+            // when advancing past the skipped file.
+            long remainingBytes = node.IsFolder ? 0 : Math.Max(0, node.Size - (_copiedBytes - bytesBefore));
+            HandleErrorDecision(sourcePath, ex, "Transfer Error", remainingBytes);
+            return false;
+        }
+    }
+
+    private static void EnsureArchiveDirectory(IFileSystemProvider provider, string path, HashSet<string> directories)
+    {
+        if (string.IsNullOrEmpty(path) || directories.Contains(path)) return;
+        provider.CreateDirectory(path);
+        directories.Add(path);
+    }
+
+    private static string CombineArchiveTarget(IFileSystemProvider provider, string root, string relativePath)
+    {
+        string target = root;
+        foreach (string segment in relativePath.Replace('\\', '/').Split('/'))
+        {
+            if (segment == "..") throw new IOException("Archive entry escapes target directory: " + relativePath);
+            if (segment.Length == 0 || segment == ".") continue;
+            target = provider.CombinePaths(target, segment);
+        }
+        return target;
     }
 
     private void CalculateTotals(IEnumerable<FileEntry> entries)
@@ -582,10 +737,11 @@ public partial class ProgressWindow : Window
             {
                 try
                 {
-                    var (files, bytes) = SshFileSystemProvider.RemoteSumTree(entry.FullPath);
+                    var (files, bytes) = SshFileSystemProvider.RemoteSumTree(entry.FullPath, _cts.Token);
                     _totalFiles += files;
                     _totalBytes += bytes;
                 }
+                catch (OperationCanceledException) { throw; }
                 catch
                 {
                     _totalFiles++;
@@ -605,7 +761,7 @@ public partial class ProgressWindow : Window
                         // offset of a self-extracting executable is handled there.
                         // This used to reach for its private OpenArchiveStream by
                         // reflection.
-                        var (files, bytes) = ArchiveService.SumTree(srcArchive, srcInternal);
+                        var (files, bytes) = ArchiveService.SumTree(srcArchive, srcInternal, _cts.Token);
                         _totalFiles += files;
                         _totalBytes += bytes;
                     }
@@ -695,7 +851,11 @@ public partial class ProgressWindow : Window
             {
                 if (!dstProvider.Exists(destPath))
                 {
-                    dstProvider.CreateDirectory(destPath);
+                    if (dstProvider is LocalDiskProvider)
+                        await WithElevationAsync(() => dstProvider.CreateDirectory(destPath),
+                            new("CreateDirectory", "", destPath));
+                    else
+                        dstProvider.CreateDirectory(destPath);
                 }
 
                 var (children, error) = await srcProvider.ReadDirectoryAsync(sourcePath, _cts.Token);
@@ -718,13 +878,18 @@ public partial class ProgressWindow : Window
                 // Delete the source folder ONLY when nothing inside was left behind
                 if (_operation == FileOperation.Move && allChildrenOk)
                 {
-                    await srcProvider.DeleteAsync(sourcePath, _cts.Token);
+                    if (srcProvider is LocalDiskProvider)
+                        await WithElevationAsync(() => srcProvider.DeleteAsync(sourcePath, _cts.Token),
+                            new("DeleteDirectory", sourcePath, ""));
+                    else
+                        await srcProvider.DeleteAsync(sourcePath, _cts.Token);
                 }
 
                 return allChildrenOk;
             }
 
-            if (dstProvider.Exists(destPath))
+            bool destinationExists = dstProvider.Exists(destPath);
+            if (destinationExists)
             {
                 if (_globalChoice == OverwriteChoice.SkipAll) { UpdateTotalProgressOnSkip(sourcePath); return false; }
                 if (!ResolveOverwriteDecision(Helpers.LastSegment(destPath))) { UpdateTotalProgressOnSkip(sourcePath); return false; }
@@ -732,7 +897,16 @@ public partial class ProgressWindow : Window
 
             if (srcProvider is LocalDiskProvider && dstProvider is LocalDiskProvider)
             {
-                CopySingleFileWin32(sourcePath, destPath);
+                bool rename = _operation == FileOperation.Move &&
+                    string.Equals(Path.GetPathRoot(sourcePath), Path.GetPathRoot(destPath), StringComparison.OrdinalIgnoreCase);
+                await WithElevationAsync(() => CopySingleFileWin32(sourcePath, destPath),
+                    new(rename ? "MoveFile" : "CopyFile", sourcePath, destPath, destinationExists), countBytes: true);
+            }
+            else if (IsPhysicalLocalFile(srcProvider, sourcePath) && IsPhysicalLocalFile(dstProvider, destPath))
+            {
+                // Archive files themselves are ordinary local files, not archive entries.
+                await WithElevationAsync(() => CopySingleFileUniversalAsync(sourcePath, destPath, srcProvider, dstProvider),
+                    new("CopyFile", sourcePath, destPath, destinationExists), countBytes: true);
             }
             else
             {
@@ -741,7 +915,11 @@ public partial class ProgressWindow : Window
 
             if (_operation == FileOperation.Move)
             {
-                await srcProvider.DeleteAsync(sourcePath, _cts.Token);
+                if (IsPhysicalLocalFile(srcProvider, sourcePath))
+                    await WithElevationAsync(() => srcProvider.DeleteAsync(sourcePath, _cts.Token),
+                        new("DeleteFile", sourcePath, ""));
+                else
+                    await srcProvider.DeleteAsync(sourcePath, _cts.Token);
             }
 
             _copiedFiles++;
@@ -804,10 +982,51 @@ public partial class ProgressWindow : Window
         {
             if (cancelFlag == 1) throw new OperationCanceledException();
             int err = Marshal.GetLastWin32Error();
-            throw new IOException($"Win32 Kernel Copy failed. Error code: {err}");
+            throw new IOException($"Win32 Kernel Copy failed. Error code: {err}", new System.ComponentModel.Win32Exception(err));
         }
 
         try { File.SetAttributes(destPath, File.GetAttributes(sourcePath)); } catch { }
+    }
+
+    private static bool IsPhysicalLocalFile(IFileSystemProvider provider, string path)
+    {
+        if (provider is LocalDiskProvider) return true;
+        if (provider is not ArchiveProvider) return false;
+        var (_, internalPath) = ArchiveService.ParseVirtualPath(path);
+        return string.IsNullOrEmpty(internalPath);
+    }
+
+    private Task WithElevationAsync(Action action, ElevatedFileOperations.Request request, bool countBytes = false) =>
+        WithElevationAsync(() => { action(); return Task.CompletedTask; }, request, countBytes);
+
+    private bool ConfirmElevation(ElevatedFileOperations.Request request) => Dispatcher.Invoke(() =>
+    {
+        EnsureWindowIsVisible();
+        string path = string.IsNullOrEmpty(request.Destination) ? request.Source : request.Destination;
+        var dialog = new ConfirmDialog(
+            $"Administrator permission is required for:\n{path}\n\nContinue this file operation as administrator?",
+            "Administrator permission") { Owner = this };
+        bool approved = dialog.ShowDialog() == true;
+        ForceActivateSelfAndOwner();
+        return approved;
+    });
+
+    private Task WithElevationAsync(Func<Task> action, ElevatedFileOperations.Request request, bool countBytes = false)
+    {
+        long bytesBefore = _copiedBytes;
+        long reported = 0;
+        return _elevatedOperations.RunAsync(action, request, !_skipAllErrors, prepareRetry: countBytes ? retry =>
+        {
+            // A retry must not count the failed attempt's bytes twice.
+            if (_copiedBytes > bytesBefore) retry = retry with { Overwrite = true };
+            _copiedBytes = bytesBefore;
+            return retry;
+        } : null, progress: countBytes ? (copied, total) =>
+        {
+            if (copied > reported) _copiedBytes += copied - reported;
+            reported = copied;
+            UpdateUi(Helpers.LastSegment(request.Source), copied, total, force: false);
+        } : null);
     }
 
     private async Task CopySingleFileUniversalAsync(string sourcePath, string destPath, IFileSystemProvider srcProvider, IFileSystemProvider dstProvider)
@@ -815,6 +1034,13 @@ public partial class ProgressWindow : Window
         await using Stream srcStream = await srcProvider.OpenReadAsync(sourcePath, _cts.Token);
         await using Stream dstStream = await dstProvider.OpenWriteAsync(destPath, _cts.Token);
 
+        long totalFileSize = 0;
+        try { totalFileSize = srcStream.Length; } catch { }
+        await CopyStreamAsync(srcStream, dstStream, Helpers.LastSegment(sourcePath), totalFileSize);
+    }
+
+    private async Task CopyStreamAsync(Stream srcStream, Stream dstStream, string fileName, long totalFileSize)
+    {
         // Pooled buffer: a fresh 1 MB array per file goes straight to the LOH and
         // makes copying thousands of small files a GC problem.
         byte[] buffer = ArrayPool<byte>.Shared.Rent(TransferBufferSize);
@@ -822,12 +1048,6 @@ public partial class ProgressWindow : Window
         {
             int bytesRead;
             long currentFileCopied = 0;
-            long totalFileSize = 0;
-
-            try { totalFileSize = srcStream.Length; } catch { }
-
-            string fileName = Helpers.LastSegment(sourcePath);
-
             while ((bytesRead = await srcStream.ReadAsync(buffer, _cts.Token)) > 0)
             {
                 await dstStream.WriteAsync(buffer.AsMemory(0, bytesRead), _cts.Token);
@@ -877,12 +1097,35 @@ public partial class ProgressWindow : Window
 
     private bool HandleSymlinkEntry(string sourcePath, string destPath, bool isDir)
     {
+        if (FileSystemFactory.GetProvider(destPath) is not LocalDiskProvider)
+            throw new NotSupportedException("Copying symbolic links to this destination is not supported.");
+
         string? rawTarget = isDir ? new DirectoryInfo(sourcePath).LinkTarget : new FileInfo(sourcePath).LinkTarget;
 
         if (rawTarget is null || _symlinkPrivilegeMissing)
         {
             UpdateTotalProgressOnSkip(sourcePath);
             return false;
+        }
+
+        FileAttributes? destinationAttributes = null;
+        try { destinationAttributes = File.GetAttributes(destPath); }
+        catch (FileNotFoundException) { }
+        catch (DirectoryNotFoundException) { }
+
+        if (destinationAttributes is { } attributes)
+        {
+            bool destinationIsDirectory = (attributes & FileAttributes.Directory) != 0;
+            if (destinationIsDirectory && (attributes & FileAttributes.ReparsePoint) == 0)
+                throw new IOException("An existing folder cannot be replaced with a symbolic link.");
+            if (destinationIsDirectory != isDir)
+                throw new IOException("A symbolic link cannot replace an item of a different type.");
+
+            if (!ResolveOverwriteDecision(Helpers.LastSegment(destPath)))
+            {
+                UpdateTotalProgressOnSkip(sourcePath);
+                return false;
+            }
         }
 
         string target = rawTarget;
@@ -892,40 +1135,66 @@ public partial class ProgressWindow : Window
             if (sourceDir != null) target = Path.GetFullPath(Path.Combine(sourceDir, rawTarget));
         }
 
+        // Create first: missing link privileges must leave the destination intact.
+        string stagedPath = Path.Combine(Path.GetDirectoryName(destPath)!, ".r2cmd-link-" + Guid.NewGuid().ToString("N"));
+        bool staged = false;
         try
         {
-            if (Directory.Exists(destPath)) Directory.Delete(destPath, true);
-            else if (File.Exists(destPath))
+            try
             {
-                File.SetAttributes(destPath, FileAttributes.Normal);
-                File.Delete(destPath);
+                if (isDir) Directory.CreateSymbolicLink(stagedPath, target);
+                else File.CreateSymbolicLink(stagedPath, target);
+                staged = true;
+            }
+            catch (IOException ex) when ((ex.HResult & 0xFFFF) == 1314)
+            {
+                _symlinkPrivilegeMissing = true;
+                Application.Current.Dispatcher.Invoke(() =>
+                {
+                    EnsureWindowIsVisible();
+                    MessageDialog.Show(this, "Cannot create symbolic links without elevated rights.\n\n" +
+                        "To copy links AS links, either run this app as Administrator, or enable Windows Developer Mode.\n\n" +
+                        "Remaining symbolic links will be skipped.", "Symbolic links");
+                    ForceActivateSelfAndOwner();
+                });
+                UpdateTotalProgressOnSkip(sourcePath);
+                return false;
+            }
+
+            _cts.Token.ThrowIfCancellationRequested();
+
+            if (isDir)
+            {
+                // Only an existing directory link reaches here; never recurse.
+                if (destinationAttributes.HasValue) Directory.Delete(destPath, recursive: false);
+                Directory.Move(stagedPath, destPath);
+            }
+            else
+            {
+                if (destinationAttributes is { } fileAttributes && (fileAttributes & FileAttributes.ReparsePoint) == 0)
+                    File.SetAttributes(destPath, FileAttributes.Normal);
+                File.Move(stagedPath, destPath, overwrite: destinationAttributes.HasValue);
+            }
+            staged = false;
+
+            if (_operation == FileOperation.Move)
+            {
+                if (isDir) Directory.Delete(sourcePath, recursive: false);
+                else File.Delete(sourcePath);
             }
         }
-        catch { }
-
-        try
+        finally
         {
-            if (isDir) Directory.CreateSymbolicLink(destPath, target);
-            else File.CreateSymbolicLink(destPath, target);
-        }
-        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
-        {
-            _symlinkPrivilegeMissing = true;
-            Application.Current.Dispatcher.Invoke(() =>
+            if (staged)
             {
-                EnsureWindowIsVisible();
-                MessageDialog.Show(this, "Cannot create symbolic links without elevated rights.\n\n" +
-                    "To copy links AS links, either run this app as Administrator, or enable Windows Developer Mode.\n\n" +
-                    "Remaining symbolic links will be skipped.", "Symbolic links");
-                ForceActivateSelfAndOwner();
-            });
-            UpdateTotalProgressOnSkip(sourcePath);
-            return false;
-        }
-
-        if (_operation == FileOperation.Move)
-        {
-            try { if (isDir) Directory.Delete(sourcePath, false); else File.Delete(sourcePath); } catch { }
+                try
+                {
+                    if (isDir) Directory.Delete(stagedPath, recursive: false);
+                    else File.Delete(stagedPath);
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
         }
 
         _copiedFiles++;
@@ -937,12 +1206,16 @@ public partial class ProgressWindow : Window
         return true;
     }
 
-    private void UpdateTotalProgressOnSkip(string sourcePath)
+    private void UpdateTotalProgressOnSkip(string sourcePath, long? skippedBytes = null)
     {
         _anythingSkipped = true;
         _skipCount++;
 
-        if (FileSystemFactory.GetProvider(sourcePath) is LocalDiskProvider)
+        if (skippedBytes is { } bytes)
+        {
+            _copiedBytes += Math.Max(0, bytes);
+        }
+        else if (FileSystemFactory.GetProvider(sourcePath) is LocalDiskProvider)
         {
             try
             {
@@ -1041,7 +1314,11 @@ public partial class ProgressWindow : Window
                     await PackEntryAsync(item.FullPath, item.Name, isTopLevel: true);
 
                     // Nothing inside this item was skipped: it is safe to delete
-                    if (_skipCount == skippedBefore) _fullyPacked.Add(item);
+                    if (_skipCount == skippedBefore)
+                    {
+                        _fullyPacked.Add(item);
+                        ReportItemCompleted(item);
+                    }
                 }
                 success = true;
             }

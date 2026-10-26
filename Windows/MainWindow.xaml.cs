@@ -694,7 +694,14 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (entry.IsFolder || Providers.FileSystemFactory.GetProvider(entry.FullPath) is Providers.ArchiveProvider)
+        // Enter goes INTO a folder or into an archive file itself (x.zip). A file
+        // inside an archive (x.zip\theme.css) also belongs to the archive
+        // provider, and the old test sent it into navigation too, producing a
+        // path like "x.zip\theme.css\" instead of opening the file.
+        var (archivePath, internalPath) = ArchiveService.ParseVirtualPath(entry.FullPath);
+        bool isArchiveItself = archivePath != null && string.IsNullOrEmpty(internalPath);
+
+        if (entry.IsFolder || isArchiveItself)
         {
             string pathToNavigate = entry.FullPath;
 

@@ -120,18 +120,32 @@
             </Grid>
         </Border>
 
-        <!-- Editor -->
-        <avalonEdit:TextEditor
-            x:Name="txtContent"
-            FontFamily="Cascadia Mono, Consolas, Courier New"
-            FontSize="{DynamicResource AppFontSize}"
-            ShowLineNumbers="True"
-            LineNumbersForeground="{DynamicResource Brush.TextSecondary}"
-            Background="{DynamicResource Brush.Background}"
-            Foreground="{DynamicResource Brush.TextPrimary}"
-            WordWrap="False"
-            HorizontalScrollBarVisibility="Auto"
-            VerticalScrollBarVisibility="Auto"
-            TextChanged="TxtContent_TextChanged" />
+        <Grid>
+            <!-- Editor -->
+            <avalonEdit:TextEditor
+                x:Name="txtContent"
+                FontFamily="Cascadia Mono, Consolas, Courier New"
+                FontSize="{DynamicResource AppFontSize}"
+                ShowLineNumbers="True"
+                LineNumbersForeground="{DynamicResource Brush.TextSecondary}"
+                Background="{DynamicResource Brush.Background}"
+                Foreground="{DynamicResource Brush.TextPrimary}"
+                WordWrap="False"
+                HorizontalScrollBarVisibility="Auto"
+                VerticalScrollBarVisibility="Auto"
+                TextChanged="TxtContent_TextChanged" />
+
+            <!-- Markdown preview (View mode) -->
+            <FlowDocumentScrollViewer x:Name="mdPreview"
+                Visibility="Collapsed"
+                Focusable="True"
+                FocusVisualStyle="{x:Null}"
+                BorderThickness="0"
+                ContextMenu="{x:Null}"
+                VerticalScrollBarVisibility="Auto"
+                HorizontalScrollBarVisibility="Disabled"
+                IsSelectionEnabled="True"
+                Background="{DynamicResource Brush.Background}" />
+        </Grid>
     </DockPanel>
 </Window>

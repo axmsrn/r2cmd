@@ -19,7 +19,8 @@ namespace R2Cmd;
 //
 // Badges written as ![…](…/badge/Label-Message-color) are drawn as local WPF
 // chips (no network). Body text follows the app theme; headings, links and code
-// use a fixed readable palette. Color emoji use Twemoji PNGs when online.
+// use a fixed readable palette. Emoji are drawn with the Segoe UI Emoji font.
+// Relative image paths resolve against the folder of the Markdown file.
 // =============================================================================
 public static class MarkdownRenderer
 {
@@ -44,10 +45,23 @@ public static class MarkdownRenderer
     private static readonly Color FallbackBorder = Color.FromRgb(0x45, 0x45, 0x45);
     private static readonly Color FallbackBackground = Color.FromRgb(0x25, 0x25, 0x26);
 
-    private static readonly Color MdHeading = Color.FromRgb(0x4F, 0xC3, 0xF7);
-    private static readonly Color MdLink = Color.FromRgb(0x6C, 0xB6, 0xFF);
-    private static readonly Color MdCode = Color.FromRgb(0xCE, 0x91, 0x78);
-    private static readonly Color MdQuote = Color.FromRgb(0x6A, 0x99, 0x55);
+    // Created once and frozen. A new brush per heading, link, code span and
+    // badge, and a new FontFamily per code span, added up to thousands of
+    // objects for a long document.
+    private static readonly SolidColorBrush MdHeading = Solid(Color.FromRgb(0x4F, 0xC3, 0xF7));
+    private static readonly SolidColorBrush MdLink = Solid(Color.FromRgb(0x6C, 0xB6, 0xFF));
+    private static readonly SolidColorBrush MdCode = Solid(Color.FromRgb(0xCE, 0x91, 0x78));
+    private static readonly SolidColorBrush MdQuote = Solid(Color.FromRgb(0x6A, 0x99, 0x55));
+    private static readonly SolidColorBrush BadgeLabel = Solid(Color.FromRgb(0x55, 0x55, 0x55));
+
+    private static readonly FontFamily MonoFont = new("Cascadia Mono, Consolas, Courier New");
+    private static readonly FontFamily EmojiFont = new("Segoe UI Emoji, Segoe UI Symbol, Segoe UI");
+    private static readonly FontFamily BadgeFont = new("Segoe UI, Arial");
+
+    private static readonly Regex ImgTagRegex = new(
+        @"<img\s+[^>]*src\s*=\s*[""']([^""']+)[""'][^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex AltAttrRegex = new(
+        @"alt\s*=\s*[""']([^""']+)[""']", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly Regex EmojiRegex = new(
         @"(" +
@@ -151,10 +165,7 @@ public static class MarkdownRenderer
             if (trimmed.StartsWith("<") && trimmed.Contains(">"))
             {
                 CloseLists();
-                var imgMatches = Regex.Matches(
-                    trimmed,
-                    @"<img\s+[^>]*src\s*=\s*[""']([^""']+)[""'][^>]*>",
-                    RegexOptions.IgnoreCase);
+                var imgMatches = ImgTagRegex.Matches(trimmed);
                 if (imgMatches.Count > 0)
                 {
                     var p = new Paragraph
@@ -165,8 +176,7 @@ public static class MarkdownRenderer
                     foreach (Match imgMatch in imgMatches)
                     {
                         string src = imgMatch.Groups[1].Value;
-                        var altMatch = Regex.Match(
-                            imgMatch.Value, @"alt\s*=\s*[""']([^""']+)[""']", RegexOptions.IgnoreCase);
+                        var altMatch = AltAttrRegex.Match(imgMatch.Value);
                         string alt = altMatch.Success ? altMatch.Groups[1].Value : "";
                         p.Inlines.Add(BuildImage(alt, src, baseFontSize, basePath));
                         p.Inlines.Add(new Run(" "));
@@ -215,7 +225,7 @@ public static class MarkdownRenderer
                     Margin = new Thickness(0, 0, 0, baseFontSize * 0.7),
                     Padding = new Thickness(12, 4, 0, 4),
                     BorderThickness = new Thickness(3, 0, 0, 0),
-                    BorderBrush = Solid(MdQuote),
+                    BorderBrush = MdQuote,
                     Foreground = BrushOr("Brush.TextSecondary", FallbackSecondary)
                 };
                 AppendInline(quote.Inlines, trimmed.Substring(2).Trim(), baseFontSize, basePath);
@@ -315,7 +325,7 @@ public static class MarkdownRenderer
             FontSize = baseFontSize * scale[level - 1],
             FontWeight = FontWeights.SemiBold,
             Margin = new Thickness(0, baseFontSize * 0.9, 0, baseFontSize * 0.4),
-            Foreground = level <= 2 ? Solid(MdHeading) : BrushOr("Brush.TextPrimary", FallbackPrimary)
+            Foreground = level <= 2 ? MdHeading : BrushOr("Brush.TextPrimary", FallbackPrimary)
         };
         AppendInline(heading.Inlines, text, baseFontSize, basePath);
         if (level <= 2)
@@ -332,7 +342,7 @@ public static class MarkdownRenderer
         var codeBox = new TextBox
         {
             Text = code,
-            FontFamily = new FontFamily("Cascadia Mono, Consolas, Courier New"),
+            FontFamily = MonoFont,
             FontSize = baseFontSize * 0.92,
             Padding = new Thickness(10, 8, 26, 8),
             BorderThickness = new Thickness(0),
@@ -342,7 +352,7 @@ public static class MarkdownRenderer
             VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
             Background = Brushes.Transparent,
             AcceptsReturn = true,
-            Foreground = Solid(MdCode),
+            Foreground = MdCode,
             CaretBrush = BrushOr("Brush.TextPrimary", FallbackPrimary)
         };
 
@@ -555,9 +565,9 @@ public static class MarkdownRenderer
                     FlushPlain();
                     target.Add(new Run(text.Substring(i + 1, end - i - 1))
                     {
-                        FontFamily = new FontFamily("Cascadia Mono, Consolas, Courier New"),
+                        FontFamily = MonoFont,
                         FontSize = baseFontSize * 0.92,
-                        Foreground = Solid(MdCode),
+                        Foreground = MdCode,
                         Background = BrushOr("Brush.Surface", FallbackSurface)
                     });
                     i = end + 1;
@@ -642,7 +652,7 @@ public static class MarkdownRenderer
         var link = new Hyperlink(new Run(string.IsNullOrEmpty(label) ? url : label))
         {
             ToolTip = url,
-            Foreground = Solid(MdLink)
+            Foreground = MdLink
         };
         if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
             link.NavigateUri = uri;
@@ -735,7 +745,7 @@ public static class MarkdownRenderer
         {
             Text = label,
             FontSize = fontSize,
-            FontFamily = new FontFamily("Segoe UI, Arial"),
+            FontFamily = BadgeFont,
             Foreground = Brushes.White,
             Padding = new Thickness(0),
             Margin = new Thickness(0)
@@ -744,7 +754,7 @@ public static class MarkdownRenderer
         {
             Text = message,
             FontSize = fontSize,
-            FontFamily = new FontFamily("Segoe UI, Arial"),
+            FontFamily = BadgeFont,
             Foreground = Brushes.White,
             Padding = new Thickness(0),
             Margin = new Thickness(0)
@@ -752,7 +762,7 @@ public static class MarkdownRenderer
 
         var left = new Border
         {
-            Background = Solid(Color.FromRgb(0x55, 0x55, 0x55)),
+            Background = BadgeLabel,
             Padding = new Thickness(7, 2, 7, 2),
             Child = leftText
         };
@@ -939,6 +949,13 @@ public static class MarkdownRenderer
                 bitmap.UriSource = uri;
                 bitmap.CacheOption = BitmapCacheOption.OnLoad;
                 bitmap.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+
+                // A local screenshot is decoded no wider than the screen: the
+                // document never shows it larger, and a 4K screenshot decoded
+                // in full takes about 33 MB. Remote images download
+                // asynchronously and their size is not known up front.
+                if (uri.IsFile) bitmap.DecodePixelWidth = DecodeWidthFor(uri.LocalPath);
+
                 bitmap.EndInit();
                 if (bitmap.CanFreeze) bitmap.Freeze();
                 image.Source = bitmap;
@@ -949,26 +966,39 @@ public static class MarkdownRenderer
         return image;
     }
 
+    // 0 keeps the original width. Only images wider than the screen are
+    // reduced; setting a decode width above the original would enlarge it.
+    private static int DecodeWidthFor(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+
+            // Header only, no pixels
+            var header = BitmapFrame.Create(stream, BitmapCreateOptions.DelayCreation, BitmapCacheOption.None);
+
+            double dpi = Application.Current?.MainWindow is Visual window
+                ? VisualTreeHelper.GetDpi(window).DpiScaleX
+                : 1.0;
+            int limit = (int)(SystemParameters.PrimaryScreenWidth * dpi);
+
+            return header.PixelWidth > limit ? limit : 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
     private static Inline BuildEmojiImage(string emoji, double fontSize)
     {
         // Offline-first: no CDN. WPF may tint emoji with the theme color
         // (monochrome), but it always works without network.
         return new Run(emoji)
         {
-            FontFamily = new FontFamily("Segoe UI Emoji, Segoe UI Symbol, Segoe UI"),
+            FontFamily = EmojiFont,
             FontSize = fontSize,
             Foreground = BrushOr("Brush.TextPrimary", FallbackPrimary)
         };
-    }
-
-    private static string ToTwemojiFilename(string emoji)
-    {
-        var parts = new List<string>();
-        foreach (var rune in emoji.EnumerateRunes())
-        {
-            if (rune.Value == 0xFE0F) continue;
-            parts.Add(rune.Value.ToString("x"));
-        }
-        return string.Join("-", parts);
     }
 }

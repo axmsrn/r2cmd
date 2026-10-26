@@ -1,3 +1,4 @@
+<!-- File: R2Cmd.csproj | Path: R2Cmd.csproj | Version: 2026-10-26 -->
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
@@ -7,8 +8,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>R2Cmd</AssemblyName>
+    <Version>0.74.0</Version>
     <RootNamespace>R2Cmd</RootNamespace>
-    <ApplicationIcon>Assets\appicon.ico</ApplicationIcon>
+    <ApplicationIcon Condition="Exists('Assets\appicon.ico')">Assets\appicon.ico</ApplicationIcon>
 
     <!-- Enable unsafe code required by [LibraryImport] source generators -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -32,8 +34,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="Tests\**\*.cs" />
     <PackageReference Include="SharpCompress" Version="0.50.4" />
     <PackageReference Include="SSH.NET" Version="2026.0.0" />
+    <PackageReference Include="SshNet.Agent" Version="2026.0.0" />
     <PackageReference Include="AvalonEdit" Version="6.3.1.120" />
   </ItemGroup>
 

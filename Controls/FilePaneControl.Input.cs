@@ -1,3 +1,4 @@
+// File: FilePaneControl.Input.cs | Path: Controls/FilePaneControl.Input.cs | Version: 2026-10-22
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -32,6 +33,11 @@ public partial class FilePaneControl
     public event EventHandler<FilesDroppedEventArgs>? FilesDropped;
 
     private static readonly string s_dragSourceFormat = "R2Cmd_Source";
+
+    // The dragged rows themselves, for a drop on the other pane. Entries inside
+    // an archive or on an SSH server have no real path, so a FileDrop list
+    // cannot describe them; the transfer pipeline handles them from these.
+    private static readonly string s_dragItemsFormat = "R2Cmd_Items";
 
     public static readonly DependencyProperty IsDropTargetProperty =
         DependencyProperty.RegisterAttached("IsDropTarget", typeof(bool), typeof(FilePaneControl), new PropertyMetadata(false));
@@ -112,13 +118,17 @@ public partial class FilePaneControl
     // eliminating micro-freezes during rapid keyboard navigation.
     private void FocusListItem(object item)
     {
+        // Move the logical cursor immediately, even if its container is not
+        // realized yet. Key repeats must start from the latest cursor position.
+        lvFiles.SelectedItem = item;
         lvFiles.ScrollIntoView(item);
 
         // Yield to the UI thread to allow the virtualizing panel to realize the new container
         // before we attempt to focus it
         Dispatcher.BeginInvoke(new Action(() =>
         {
-            if (lvFiles.ItemContainerGenerator.ContainerFromItem(item) is ListViewItem container)
+            if (ReferenceEquals(lvFiles.SelectedItem, item) &&
+                lvFiles.ItemContainerGenerator.ContainerFromItem(item) is ListViewItem container)
             {
                 container.Focus();
             }
@@ -351,14 +361,17 @@ public partial class FilePaneControl
         if (!items.Any(i => ReferenceEquals(i, startItem)))
             items = new List<FileEntry> { startItem };
 
-        var paths = items
+        var entries = items
             .Where(f => f.Name != ".." && !string.IsNullOrEmpty(f.FullPath) && f.FullPath != ":::NEW:::")
-            .Where(f => File.Exists(f.FullPath) || Directory.Exists(f.FullPath))
-            .Select(f => f.FullPath)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .DistinctBy(f => f.FullPath, StringComparer.Ordinal)
             .ToArray();
 
-        if (paths.Length == 0) return;
+        if (entries.Length == 0) return;
+
+        // Real files on disk: dragged as before, copy or move anywhere.
+        // Anything else (inside an archive, on SSH): copy only, and outside the
+        // application the files are produced when the target asks for them.
+        bool allLocal = entries.All(f => File.Exists(f.FullPath) || Directory.Exists(f.FullPath));
 
         _renameClickTimer?.Stop();
         _renameClickTimer = null;
@@ -366,10 +379,24 @@ public partial class FilePaneControl
         _dragStartItem = null;
         _ctrlClickItem = null;
 
-        var data = new DataObject();
-        data.SetData(DataFormats.FileDrop, paths);
-        data.SetData(DataFormats.Text, string.Join(Environment.NewLine, paths));
+        IDataObject data;
+        if (allLocal)
+        {
+            var paths = entries.Select(f => f.FullPath).ToArray();
+            var local = new DataObject();
+            local.SetData(DataFormats.FileDrop, paths);
+            local.SetData(DataFormats.Text, string.Join(Environment.NewLine, paths));
+            data = local;
+        }
+        else
+        {
+            data = new ExtractOnDropData(entries);
+        }
+
         data.SetData(s_dragSourceFormat, this);
+        data.SetData(s_dragItemsFormat, entries);
+
+        var allowed = allLocal ? DragDropEffects.Copy | DragDropEffects.Move : DragDropEffects.Copy;
 
         _isDragging = true;
         try
@@ -377,7 +404,7 @@ public partial class FilePaneControl
             // Link is deliberately absent: nothing in the app creates shortcuts,
             // and offering it means Ctrl+Shift+drag into Explorer produces a .lnk
             // where the user expected a copy
-            DragDrop.DoDragDrop(lvFiles, data, DragDropEffects.Copy | DragDropEffects.Move);
+            DragDrop.DoDragDrop(lvFiles, data, allowed);
         }
         catch (Exception ex)
         {
@@ -389,25 +416,37 @@ public partial class FilePaneControl
         }
     }
 
+    private FileEntry? _lastShiftArrowEntry;
+
     private void LvFiles_PreviewKeyDown(object sender, KeyEventArgs e)
     {
         if (_renamingEntry != null) return; // Block arrow navigation during rename
 
-        if ((e.Key == Key.Up || e.Key == Key.Down) && Keyboard.Modifiers == ModifierKeys.None)
+        var modifiers = Keyboard.Modifiers;
+        if (e.Key is not (Key.Up or Key.Down) ||
+            modifiers is not (ModifierKeys.None or ModifierKeys.Shift)) return;
+
+        e.Handled = true;
+        if (lvFiles.Items.Count == 0) return;
+
+        int idx = Math.Max(0, lvFiles.SelectedIndex);
+
+        if (modifiers == ModifierKeys.Shift && lvFiles.Items[idx] is FileEntry entry && entry.Name != "..")
         {
-            var focusedContainer = GetFocusedOrSelectedContainer();
-            if (focusedContainer == null) return;
-
-            e.Handled = true;
-
-            int idx = lvFiles.ItemContainerGenerator.IndexFromContainer(focusedContainer);
-            int newIdx = e.Key == Key.Up ? idx - 1 : idx + 1;
-
-            if (newIdx >= 0 && newIdx < lvFiles.Items.Count)
+            // Like Insert: toggle the current mark, then move the cursor.
+            // Holding an arrow at the edge must not toggle the same row repeatedly.
+            if (!e.IsRepeat || !ReferenceEquals(_lastShiftArrowEntry, entry))
             {
-                FocusListItem(lvFiles.Items[newIdx]);
+                entry.IsMarked = !entry.IsMarked;
+                UpdateMarkedStatus();
             }
+            _lastShiftArrowEntry = entry;
         }
+        else _lastShiftArrowEntry = null;
+
+        int newIdx = Math.Clamp(e.Key == Key.Up ? idx - 1 : idx + 1, 0, lvFiles.Items.Count - 1);
+        if (newIdx != idx || lvFiles.SelectedIndex < 0)
+            FocusListItem(lvFiles.Items[newIdx]);
     }
 
     private void LvFiles_KeyDown(object sender, KeyEventArgs e)
@@ -786,11 +825,27 @@ public partial class FilePaneControl
         return false;
     }
 
+    private static bool IsVirtualPath(string path)
+    {
+        if (path.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase)) return true;
+        var (archive, inner) = ArchiveService.ParseVirtualPath(path);
+        return archive != null && !string.IsNullOrEmpty(inner);
+    }
+
     // Shift means move, exactly as in DragOver. Without this the very first frame
     // of the drag showed a copy cursor and then flipped.
     private static DragDropEffects EffectFor(DragEventArgs e)
     {
-        if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return DragDropEffects.None;
+        bool fromPane = e.Data.GetDataPresent(s_dragItemsFormat);
+        if (!fromPane && !e.Data.GetDataPresent(DataFormats.FileDrop)) return DragDropEffects.None;
+
+        // Nothing can be moved out of an archive or off a server by dragging.
+        // Decided from the path text alone: this runs on every mouse move.
+        if (fromPane && e.Data.GetData(s_dragItemsFormat) is FileEntry[] dragged &&
+            dragged.Any(i => IsVirtualPath(i.FullPath)))
+        {
+            return DragDropEffects.Copy;
+        }
 
         bool isShift = (e.KeyStates & DragDropKeyStates.ShiftKey) != 0;
         return isShift ? DragDropEffects.Move : DragDropEffects.Copy;
@@ -849,6 +904,23 @@ public partial class FilePaneControl
         // reported for a location that refuses it during the drag
         if (IsDropRefused(e, dropItem))
         {
+            e.Effects = DragDropEffects.None;
+            e.Handled = true;
+            return;
+        }
+
+        // A drag from one of our panes: the rows themselves. Archive and SSH
+        // entries go straight to the transfer pipeline; nothing is extracted
+        // to a temporary folder first.
+        if (e.Data.GetData(s_dragItemsFormat) is FileEntry[] draggedRows && draggedRows.Length > 0)
+        {
+            string target = dropItem != null && dropItem.IsFolder && dropItem.Name != ".."
+                ? dropItem.FullPath
+                : CurrentPath;
+
+            bool isMove = EffectFor(e) == DragDropEffects.Move;
+            FilesDropped?.Invoke(this, new FilesDroppedEventArgs(draggedRows.ToList(), isMove, target));
+
             e.Effects = DragDropEffects.None;
             e.Handled = true;
             return;
@@ -913,5 +985,109 @@ public partial class FilePaneControl
         // file itself after we have already processed the move operation.
         e.Effects = DragDropEffects.None;
         e.Handled = true;
+    }
+
+    // =========================================================================
+    // Drag data for items that are not real files (inside an archive).
+    //
+    // Explorer and the desktop only accept a FileDrop list of real paths. The
+    // entries are extracted to a temporary folder at the moment a target asks
+    // for that list, which happens only when the drag leaves the application.
+    // A drop on the other pane reads R2Cmd_Items instead and extracts nothing.
+    // The temporary folder is under %TEMP%\R2Cmd, removed when the app exits.
+    //
+    // SSH entries are offered to the panes only: downloading a whole selection
+    // inside the drag loop would freeze the window for the length of the
+    // transfer.
+    // =========================================================================
+    private sealed class ExtractOnDropData : IDataObject
+    {
+        private readonly DataObject _inner = new();
+        private readonly FileEntry[] _entries;
+        private readonly bool _canExtract;
+        private string[]? _extracted;
+        private bool _failed;
+
+        public ExtractOnDropData(FileEntry[] entries)
+        {
+            _entries = entries;
+            _canExtract = entries.All(e => IsLocal(e.FullPath) || IsInArchive(e.FullPath));
+        }
+
+        private static bool IsLocal(string path) => File.Exists(path) || Directory.Exists(path);
+
+        private static bool IsInArchive(string path)
+        {
+            var (archive, inner) = ArchiveService.ParseVirtualPath(path);
+            return archive != null && !string.IsNullOrEmpty(inner);
+        }
+
+        private bool IsFileDrop(string format) => _canExtract && format == DataFormats.FileDrop;
+
+        private string[]? Extract()
+        {
+            if (_extracted != null || _failed) return _extracted;
+
+            try
+            {
+                string folder = Path.Combine(Path.GetTempPath(), "R2Cmd", "drag", Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(folder);
+
+                var result = new List<string>(_entries.Length);
+                foreach (var entry in _entries)
+                {
+                    if (IsLocal(entry.FullPath))
+                    {
+                        result.Add(entry.FullPath);
+                        continue;
+                    }
+
+                    var (archive, inner) = ArchiveService.ParseVirtualPath(entry.FullPath);
+                    string target = Path.Combine(folder, entry.Name);
+
+                    if (entry.IsFolder)
+                    {
+                        Directory.CreateDirectory(target);
+                        ArchiveService.ExtractFolder(archive!, inner, target);
+                    }
+                    else
+                    {
+                        ArchiveService.ExtractFile(archive!, inner, target);
+                    }
+
+                    result.Add(target);
+                }
+
+                _extracted = result.ToArray();
+            }
+            catch
+            {
+                _failed = true;
+            }
+
+            return _extracted;
+        }
+
+        public object? GetData(string format) => GetData(format, true);
+        public object? GetData(Type format) => _inner.GetData(format);
+        public object? GetData(string format, bool autoConvert) =>
+            IsFileDrop(format) ? Extract() : _inner.GetData(format, autoConvert);
+
+        public bool GetDataPresent(string format) => IsFileDrop(format) || _inner.GetDataPresent(format);
+        public bool GetDataPresent(Type format) => _inner.GetDataPresent(format);
+        public bool GetDataPresent(string format, bool autoConvert) =>
+            IsFileDrop(format) || _inner.GetDataPresent(format, autoConvert);
+
+        public string[] GetFormats() => GetFormats(true);
+        public string[] GetFormats(bool autoConvert)
+        {
+            var formats = _inner.GetFormats(autoConvert);
+            return _canExtract ? formats.Append(DataFormats.FileDrop).Distinct().ToArray() : formats;
+        }
+
+        public void SetData(object data) => _inner.SetData(data);
+        public void SetData(string format, object data) => _inner.SetData(format, data);
+        public void SetData(Type format, object data) => _inner.SetData(format, data);
+        public void SetData(string format, object data, bool autoConvert) => _inner.SetData(format, data, autoConvert);
     }
 }

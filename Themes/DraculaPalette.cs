@@ -73,6 +73,9 @@ internal static class DraculaPalette
     internal static SolidColorBrush GetCommentBrush() =>
         ThemeManager.IsDarkTheme ? CommentBrush : LightCommentBrush;
 
+    internal static SolidColorBrush GetPurpleBrush() =>
+        ThemeManager.IsDarkTheme ? PurpleBrush : LightPurpleBrush;
+
     private static SolidColorBrush CreateBrush(Color color)
     {
         var brush = new SolidColorBrush(color);

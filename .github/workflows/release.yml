@@ -1,0 +1,174 @@
+name: Publish Windows release
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/release-version.txt']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag; leave empty to use .github/release-version.txt'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-windows-release
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    if: github.repository == 'axmsrn/r2cmd'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${INPUT_VERSION:-}"
+          if [[ -z "$tag" ]]; then
+            tag="$(tr -d '\r\n' < .github/release-version.txt)"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Expected a version such as v0.74 or v1.2.3." >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            version="$version.0"
+          fi
+          printf 'tag=%s\nversion=%s\n' "$tag" "$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+      APP_VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+      - name: Run archive regression checks
+        run: dotnet run --project Tests/R2Cmd.ArchiveChecks.csproj -c Release -warnaserror
+      - name: Publish Windows application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dotnet publish R2Cmd.csproj -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=false `
+            "-p:Version=$env:APP_VERSION" `
+            -warnaserror -o build/publish
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-Item build/publish/R2Cmd.exe
+          if ($exe.VersionInfo.ProductVersion -notlike "$env:APP_VERSION*") {
+            throw "The executable does not contain the requested product version."
+          }
+          Write-Host "Built $($exe.Name), version $($exe.VersionInfo.ProductVersion), $($exe.Length) bytes."
+      - name: Package executable, documentation, and checksum
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/package, dist | Out-Null
+          Copy-Item build/publish/* build/package -Recurse
+          Copy-Item LICENSE build/package/LICENSE
+          Copy-Item ver.md build/package/CHANGELOG.md
+          @"
+          R2Cmd $env:RELEASE_TAG - Windows x64
+
+          Extract the ZIP to a folder and run R2Cmd.exe.
+          No installation or separate .NET runtime is required.
+
+          Open local folders or select NET to add an SSH connection.
+          F3: view, F4: edit, F5: copy, F6: move, Alt+F7: search.
+
+          Settings: %APPDATA%\R2Cmd\settings.json
+          Documentation: https://github.com/axmsrn/r2cmd
+          Report a problem: https://github.com/axmsrn/r2cmd/issues
+
+          Free for personal, educational, and other non-commercial use.
+          Commercial use requires prior written permission. See LICENSE.
+          "@ | Set-Content build/package/README.txt -Encoding utf8
+          $archive = "R2Cmd-$env:RELEASE_TAG-win-x64.zip"
+          Compress-Archive -Path build/package/* -DestinationPath "dist/$archive" -CompressionLevel Optimal
+          $hash = (Get-FileHash "dist/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          Write-Host "Created $archive and SHA256SUMS.txt."
+      - name: Upload release package
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: windows-release
+          path: dist/*
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+      RELEASE_TARGET: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: windows-release
+          path: dist
+      - name: Verify and publish the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum --check SHA256SUMS.txt
+          )
+          if git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}" > "$RUNNER_TEMP/tag-target" 2>/dev/null; then
+            if [[ "$(cat "$RUNNER_TEMP/tag-target")" != "$RELEASE_TARGET" ]]; then
+              echo "The release tag already points to another commit; refusing to move it." >&2
+              exit 1
+            fi
+          fi
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            printf 'R2Cmd %s brings Windows files, SSH/SFTP, a terminal, and an editor together in one application.\n\n' "$RELEASE_TAG"
+            printf 'Download **R2Cmd-%s-win-x64.zip**, extract it, and run **R2Cmd.exe**. No installation or separate .NET runtime is required.\n\n' "$RELEASE_TAG"
+            cat ver.md
+            printf '\n\n---\nBuilt from commit `%s`. A SHA-256 checksum is included in `SHA256SUMS.txt`.\n' "$RELEASE_TARGET"
+          } > "$notes"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft > "$RUNNER_TEMP/release-is-draft" 2>/dev/null; then
+            if [[ "$(cat "$RUNNER_TEMP/release-is-draft")" != true ]]; then
+              echo "This release is already published; choose a new version." >&2
+              exit 1
+            fi
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$RELEASE_TARGET" --title "R2Cmd $RELEASE_TAG" --notes-file "$notes"
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$RELEASE_TARGET" --title "R2Cmd $RELEASE_TAG" --notes-file "$notes" --draft
+          fi
+          gh release upload "$RELEASE_TAG" "dist/R2Cmd-$RELEASE_TAG-win-x64.zip" dist/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,isDraft

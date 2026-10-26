@@ -44,8 +44,48 @@ public partial class EditorWindow : Window
 
         _scroller = new SmoothWheelScroller(Dispatcher);
         _scroller.Attach(txtContent);
+        _scroller.Attach(mdPreview);
+
+        _isMarkdown = FileTypes.Markdown.Contains(Path.GetExtension(displayName));
+        if (!_isMarkdown) txtMode.Cursor = null;
+
+        mdPreview.AddHandler(System.Windows.Documents.Hyperlink.RequestNavigateEvent,
+            new System.Windows.Navigation.RequestNavigateEventHandler(OnPreviewLink));
 
         ContentRendered += (_, _) => LoadFile();
+
+        // The event is static: without unsubscribing, every closed editor
+        // would stay in memory and keep reacting to theme switches
+        ThemeManager.ThemeChanged += OnThemeChanged;
+        Closed += (_, _) => ThemeManager.ThemeChanged -= OnThemeChanged;
+    }
+
+    // =========================================================================
+    // Theme switched while the editor is open. XAML parts follow on their own
+    // (DynamicResource); the editor colours, the title bar and the Markdown
+    // preview are set in code and are applied again here. The text is not
+    // reloaded: it may hold unsaved changes.
+    // =========================================================================
+    private void OnThemeChanged(object? sender, EventArgs e)
+    {
+        if (TryFindResource("Brush.Background") is Brush background)
+            Resources[SystemColors.ControlBrushKey] = background;
+
+        Helpers.SetTitleBarTheme(this, ThemeManager.IsDarkTheme, useSurfaceColor: true);
+        ApplyEditorTheme();
+
+        if (_previewing)
+        {
+            mdPreview.Document = MarkdownRenderer.Render(
+                txtContent.Text, Math.Max(13, FontSize), Path.GetDirectoryName(_path));
+        }
+    }
+
+    private void ApplyEditorTheme()
+    {
+        string extension = AvalonEditDraculaTheme.GetHighlightingExtension(_path);
+        bool plainText = FileTypes.PlainText.Contains(extension);
+        AvalonEditDraculaTheme.Apply(txtContent, _path, showLineNumbers: !plainText);
     }
 
     private void LoadFile()
@@ -69,9 +109,7 @@ public partial class EditorWindow : Window
             _dirty = false;
             Title = $"Edit: {_displayName}";
 
-            string extension = AvalonEditDraculaTheme.GetHighlightingExtension(_path);
-            bool plainText = FileTypes.PlainText.Contains(extension);
-            AvalonEditDraculaTheme.Apply(txtContent, _path, showLineNumbers: !plainText);
+            ApplyEditorTheme();
 
             UpdateStatus();
             txtContent.Focus();
@@ -198,7 +236,14 @@ public partial class EditorWindow : Window
             return;
         }
 
-        if (!_dirty) return;
+        // A clean document (also the second Close() after saving) closes at once,
+        // but the owner must still be activated or Windows brings up whatever
+        // window was behind it (VS Code, a browser, ...)
+        if (!_dirty)
+        {
+            ActivateOwner();
+            return;
+        }
 
         var dialog = new ConfirmDialog(
             message: "Do you want to save the changes?",
@@ -216,8 +261,11 @@ public partial class EditorWindow : Window
         {
             case ConfirmDialog.ConfirmResult.Yes:
                 // The close is held while the upload runs; once saved, the
-                // document is clean and the second Close() goes straight through
+                // document is clean and the second Close() goes straight through.
+                // Yield first: a local save can finish synchronously, and WPF
+                // forbids Close()/ShowDialog() while this Closing is still running
                 e.Cancel = true;
+                await Dispatcher.Yield();
                 if (await SaveAsync() && !_dirty) Close();
                 return;
             case ConfirmDialog.ConfirmResult.Cancel:
@@ -225,8 +273,11 @@ public partial class EditorWindow : Window
                 break;
         }
 
-        if (e.Cancel) return;
+        if (!e.Cancel) ActivateOwner();
+    }
 
+    private void ActivateOwner()
+    {
         if (Owner != null)
             Owner.Activate();
         else if (Application.Current.MainWindow != null &&
@@ -236,7 +287,7 @@ public partial class EditorWindow : Window
 
     private void UpdateStatus()
     {
-        txtMode.Text = "Edit";
+        txtMode.Text = _previewing ? "View" : "Edit";
         txtEncoding.Text = _forcedEncoding == null
             ? string.IsNullOrEmpty(_encodingName) ? "Auto" : _encodingName
             : EncodingChoices.Names[_encodingIndex];
@@ -254,8 +305,59 @@ public partial class EditorWindow : Window
         txtStatusRight.Text = _dirty ? "  •  modified" : "";
     }
 
-    private void TxtMode_MouseLeftButtonDown(object sender, MouseButtonEventArgs e) =>
+    // =========================================================================
+    // Markdown files: the mode label switches between the source (Edit) and
+    // the rendered document (View). The preview is built from the text in the
+    // editor, unsaved changes included, with the same renderer as F3.
+    // Ctrl+Shift+V does the same, as in the viewer.
+    // =========================================================================
+    private readonly bool _isMarkdown;
+    private bool _previewing;
+
+    private void TxtMode_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
         e.Handled = true;
+        if (_isMarkdown) TogglePreview();
+    }
+
+    private void TogglePreview(bool focus = true)
+    {
+        _previewing = !_previewing;
+
+        if (_previewing)
+        {
+            // Relative images resolve next to the file
+            mdPreview.Document = MarkdownRenderer.Render(
+                txtContent.Text, Math.Max(13, FontSize), Path.GetDirectoryName(_path));
+
+            txtContent.Visibility = Visibility.Collapsed;
+            mdPreview.Visibility = Visibility.Visible;
+            if (focus) mdPreview.Focus();
+        }
+        else
+        {
+            mdPreview.Visibility = Visibility.Collapsed;
+            mdPreview.Document = null;   // rebuilt on the next switch anyway
+            txtContent.Visibility = Visibility.Visible;
+            if (focus) txtContent.Focus();
+        }
+
+        UpdateStatus();
+    }
+
+    private void OnPreviewLink(object sender, System.Windows.Navigation.RequestNavigateEventArgs e)
+    {
+        e.Handled = true;
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = e.Uri.AbsoluteUri,
+                UseShellExecute = true
+            });
+        }
+        catch { }
+    }
 
     private void TxtEncoding_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
@@ -272,6 +374,21 @@ public partial class EditorWindow : Window
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
         bool control = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
+
+        // Ctrl+W closes the window; OnClosing still asks about unsaved changes
+        if (control && e.Key == Key.W)
+        {
+            e.Handled = true;
+            Close();
+            return;
+        }
+
+        if (_isMarkdown && control && (Keyboard.Modifiers & ModifierKeys.Shift) != 0 && e.Key == Key.V)
+        {
+            e.Handled = true;
+            TogglePreview();
+            return;
+        }
 
         if (control && e.Key == Key.S)
         {
@@ -334,6 +451,10 @@ public partial class EditorWindow : Window
 
     private void ExecuteSearch(string needle, bool isNew, int direction = 1)
     {
+        // Matches are selected in the source, so searching returns to Edit.
+        // Focus stays in the search box the user is typing in.
+        if (_previewing && !string.IsNullOrEmpty(needle)) TogglePreview(focus: false);
+
         if (string.IsNullOrEmpty(needle))
         {
             _textMatches.Clear();
